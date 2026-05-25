@@ -1,0 +1,50 @@
+# Copy to ./config.yaml or ~/.turbomole_orchestrator/config.yaml
+# Credentials are NOT stored here — use ssh-agent or key files.
+
+db_path: ~/.turbomole_orchestrator/jobs.sqlite
+local_workdir: ~/.turbomole_orchestrator/workspace
+download_dir: ~/.turbomole_orchestrator/downloads
+poll_interval_s: 30
+
+clusters:
+#  marenostrum:
+#    host: mn5.bsc.es
+#    port: 22
+#    user: my_username
+#    key_filename: ~/.ssh/id_ed25519
+#    use_agent: true
+#    remote_workdir: /gpfs/scratch/$USER/turbomole_jobs
+#    module_load:
+#      - turbomole/7.8
+#    default_partition: gp_debug
+#    default_time: "04:00:00"
+#    default_nodes: 1
+#    default_ntasks: 16
+#    default_mem: 32G
+#
+#  finis_terrae:
+#    host: ft3.cesga.es
+#    user: my_username
+#    use_agent: true
+#    remote_workdir: /mnt/lustre/scratch/nlsas/home/$USER/turbomole_jobs
+#    module_load:
+#      - cesga/2022
+#      - turbomole/7.7
+#    default_partition: shared
+#    default_time: "24:00:00"
+#    default_ntasks: 24
+#    default_mem: 64G
+
+  drago:
+    host: drago.csic.es
+    user: jramos
+    use_agent: true
+    remote_workdir: /lustre/home/iem/jramos/TmoleX_Jobs
+    module_load:
+      - rama0.4
+    env_setup: []
+    turbomole_version: "7.8"
+    default_partition: generic
+    default_time: "24:00:00"
+    default_ntasks: 48
+    default_mem: 100G

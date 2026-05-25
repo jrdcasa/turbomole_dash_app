@@ -1,0 +1,40 @@
+# Copy to ./config.yaml (next to app.py) or ~/.turbomole_orchestrator/config.yaml
+# Credentials are NOT stored here — use ssh-agent or key files.
+
+db_path: ~/.turbomole_orchestrator/jobs.sqlite
+local_workdir: ~/.turbomole_orchestrator/workspace
+download_dir: ~/.turbomole_orchestrator/downloads
+poll_interval_s: 30
+
+clusters:
+  drago:
+    host: drago.csic.es
+    port: 22
+    user: jramos
+    use_agent: true
+    remote_workdir: /lustre/home/iem/jramos/turbomole_jobs
+    module_load:
+      - rama0.4
+    env_setup: []
+    turbomole_version: "7.8"
+    default_partition: generic
+    default_time: "24:00:00"
+    default_nodes: 1
+    default_ntasks: 48
+    default_mem: 100G
+
+  # Example for a future cluster with Turbomole 8.0:
+  # other_cluster:
+  #   host: hpc.example.es
+  #   user: myuser
+  #   use_agent: true
+  #   remote_workdir: /scratch/$USER/tm_jobs
+  #   module_load:
+  #     - turbomole/8.0
+  #   env_setup: []
+  #   turbomole_version: "8.0"
+  #   default_partition: compute
+  #   default_time: "12:00:00"
+  #   default_nodes: 1
+  #   default_ntasks: 16
+  #   default_mem: 32G

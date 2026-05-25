@@ -1,0 +1,6 @@
+dash>=2.17
+dash-bootstrap-components>=1.6
+ase>=3.23
+paramiko>=3.4
+pyyaml>=6.0
+pytest
