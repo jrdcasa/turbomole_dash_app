@@ -235,3 +235,182 @@ def _to_seconds(raw: str, unit: str) -> float | None:
     if unit.startswith("hour"):
         return val * 3600
     return val
+
+
+# ===========================================================================
+# aoforce output parsing (harmonic vibrational analysis)
+# ===========================================================================
+
+@dataclass
+class AoforceSummary:
+    """Parsed output of `aoforce`. All fields optional."""
+    frequencies_cm1: list[float] = field(default_factory=list)
+    n_modes: int | None = None
+    n_imaginary: int | None = None
+    zpe_ha: float | None = None
+    enthalpy_ha: float | None = None
+    gibbs_ha: float | None = None
+    entropy_cal_mol_K: float | None = None
+    temperature_K: float | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    def lowest_frequencies(self, n: int = 5) -> list[float]:
+        """Return the n smallest frequencies (most-imaginary first)."""
+        return sorted(self.frequencies_cm1)[:n]
+
+    def as_display_dict(self) -> dict[str, str]:
+        d: dict[str, str] = {}
+        if self.n_modes is not None:
+            d["Vibrational modes"] = str(self.n_modes)
+        if self.n_imaginary is not None:
+            tag = ""
+            if self.n_imaginary == 0:
+                tag = "  (minimum)"
+            elif self.n_imaginary == 1:
+                tag = "  (possible transition state)"
+            elif self.n_imaginary > 1:
+                tag = "  (higher-order saddle point)"
+            d["Imaginary modes"] = f"{self.n_imaginary}{tag}"
+        if self.frequencies_cm1:
+            lows = self.lowest_frequencies(5)
+            d["Lowest 5 frequencies"] = ", ".join(
+                f"{f:+.1f}" for f in lows
+            ) + " cm⁻¹"
+        if self.zpe_ha is not None:
+            d["Zero-point energy"] = f"{self.zpe_ha:.6f} Ha"
+        if self.temperature_K is not None:
+            d["Thermo temperature"] = f"{self.temperature_K:.2f} K"
+        if self.enthalpy_ha is not None:
+            d["Enthalpy H(T)"] = f"{self.enthalpy_ha:.6f} Ha"
+        if self.gibbs_ha is not None:
+            d["Gibbs free energy G(T)"] = f"{self.gibbs_ha:.6f} Ha"
+        if self.entropy_cal_mol_K is not None:
+            d["Total entropy S"] = f"{self.entropy_cal_mol_K:.3f} cal/(mol·K)"
+        return d
+
+
+# Regex collection for aoforce.out. Turbomole's output format has been
+# stable across 7.x/8.x for the lines we care about.
+
+# Frequency lines look like:
+#   mode               1        2        3        4        5        6
+#   frequency        -0.00     0.00     0.00     0.00     0.00     0.00
+# We capture *every* frequency value on lines starting with "frequency".
+# Negative values denote imaginary modes (the binary prints them as
+# negative numbers; some versions print them with an "i" suffix as well).
+_RE_AOFORCE_FREQ_LINE = re.compile(r"^\s*frequency\s+(.+)$",
+                                    re.IGNORECASE | re.MULTILINE)
+
+# A single frequency token: optional sign, digits.digits, optional 'i'
+_RE_FREQ_TOKEN = re.compile(r"(-?\d+\.\d+)i?")
+
+# Zero-point vibrational energy:
+#   zero point VIBRATIONAL energy  :        0.0234567   Hartree
+_RE_ZPE = re.compile(
+    r"zero\s*point\s+VIBRATIONAL\s+energy\s*:\s*(-?\d+\.\d+)\s*Hartree",
+    re.IGNORECASE,
+)
+
+# Thermo block. Different Turbomole versions phrase it differently;
+# we accept the common patterns. Example:
+#   T =       298.15 K
+#   enthalpy            =     -76.42352   Hartree
+#   chem. potential     =     -76.45123   Hartree    <- this is G
+#   entropy             =      45.123     J/(mol K)
+_RE_THERMO_T = re.compile(
+    r"\bT\s*=\s*(-?\d+\.\d+)\s*K", re.IGNORECASE,
+)
+_RE_THERMO_H = re.compile(
+    r"\b(?:enthalpy|H\(T\))\s*[:=]\s*(-?\d+\.\d+)\s*Hartree",
+    re.IGNORECASE,
+)
+_RE_THERMO_G = re.compile(
+    r"\b(?:chem\.\s*potential|G\(T\)|Gibbs\s*free\s*energy)\s*"
+    r"[:=]\s*(-?\d+\.\d+)\s*Hartree",
+    re.IGNORECASE,
+)
+# Entropy: keep the cal/(mol·K) form because that's the common chemistry
+# unit. Turbomole sometimes prints in J/(mol·K); we accept either and
+# convert to cal if needed.
+_RE_THERMO_S_CAL = re.compile(
+    r"\b(?:entropy|S\(T\))\s*[:=]\s*(-?\d+\.\d+)\s*cal/\(mol\*K\)",
+    re.IGNORECASE,
+)
+_RE_THERMO_S_J = re.compile(
+    r"\b(?:entropy|S\(T\))\s*[:=]\s*(-?\d+\.\d+)\s*J/\(mol\*?K\)",
+    re.IGNORECASE,
+)
+
+
+def parse_aoforce(source: str | Path) -> AoforceSummary:
+    """Parse aoforce.out. `source` is a path OR the file content."""
+    text = _read_text(source)
+    s = AoforceSummary()
+
+    # --- Frequencies ---
+    freqs: list[float] = []
+    for line in _RE_AOFORCE_FREQ_LINE.findall(text):
+        for tok in _RE_FREQ_TOKEN.findall(line):
+            try:
+                freqs.append(float(tok))
+            except ValueError:
+                continue
+    # The first 6 modes (3 translations + 3 rotations) come out near zero
+    # for non-linear molecules; we keep them in the list but report the
+    # imaginary count using a small tolerance to ignore numerical noise.
+    if freqs:
+        s.frequencies_cm1 = freqs
+        s.n_modes = len(freqs)
+        # Modes are imaginary if frequency < -threshold; tolerance 1 cm-1
+        # excludes the near-zero translational/rotational ones.
+        s.n_imaginary = sum(1 for f in freqs if f < -1.0)
+
+    # --- ZPE ---
+    m = _RE_ZPE.search(text)
+    if m:
+        try:
+            s.zpe_ha = float(m.group(1))
+        except ValueError:
+            pass
+
+    # --- Temperature ---
+    m = _RE_THERMO_T.search(text)
+    if m:
+        try:
+            s.temperature_K = float(m.group(1))
+        except ValueError:
+            pass
+
+    # --- Enthalpy ---
+    m = _RE_THERMO_H.search(text)
+    if m:
+        try:
+            s.enthalpy_ha = float(m.group(1))
+        except ValueError:
+            pass
+
+    # --- Gibbs ---
+    m = _RE_THERMO_G.search(text)
+    if m:
+        try:
+            s.gibbs_ha = float(m.group(1))
+        except ValueError:
+            pass
+
+    # --- Entropy ---
+    m = _RE_THERMO_S_CAL.search(text)
+    if m:
+        try:
+            s.entropy_cal_mol_K = float(m.group(1))
+        except ValueError:
+            pass
+    else:
+        m = _RE_THERMO_S_J.search(text)
+        if m:
+            try:
+                # 1 cal = 4.184 J
+                s.entropy_cal_mol_K = float(m.group(1)) / 4.184
+            except ValueError:
+                pass
+
+    return s

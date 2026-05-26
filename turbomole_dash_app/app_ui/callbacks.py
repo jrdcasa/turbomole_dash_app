@@ -25,7 +25,11 @@ from backend.db import (
 )
 from backend.db_inspector import open_in_sqlite_browser
 from backend import op_tracker
-from backend.result_parser import parse_ridft, RidftSummary
+from backend import protocols as proto_mod
+from backend.result_parser import (
+    parse_ridft, RidftSummary,
+    parse_aoforce, AoforceSummary,
+)
 from backend.slurm import SlurmParams, build_slurm_script
 from backend.turbomole_io import (
     SUPPORTED_INPUT_FORMATS, build_control_file, load_structure_from_bytes,
@@ -41,6 +45,7 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tm-io")
 
 def register_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
     _register_new_job_callbacks(app, cfg)
+    _register_protocol_callbacks(app, cfg)
     _register_jobs_table_callbacks(app, cfg)
     _register_job_detail_callbacks(app, cfg)
     _register_cluster_test_callback(app, cfg)
@@ -121,11 +126,13 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         State("inp-aimd-steps", "value"),
         State("inp-aimd-dt", "value"),
         State("inp-aimd-T", "value"),
+        State("dd-dispersion", "value"),
         prevent_initial_call=True,
     )
     def _preview(n, staging, cluster_name,
                  functional, basis, task, charge, mult,
-                 ri, grid, aimd_steps, aimd_dt, aimd_T):
+                 ri, grid, aimd_steps, aimd_dt, aimd_T,
+                 dispersion):
         if not staging:
             return "Upload a structure first."
         tm_version = "7.8"
@@ -140,6 +147,7 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                 functional=functional, basis_set=basis, task_type=task,
                 charge=int(charge or 0), multiplicity=int(mult or 1),
                 grid=grid, use_ri="ri" in (ri or []),
+                dispersion=dispersion or "none",
                 aimd_steps=int(aimd_steps or 500),
                 aimd_timestep_fs=float(aimd_dt or 0.5),
                 aimd_temperature_K=float(aimd_T or 300),
@@ -150,6 +158,7 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                 f"# Turbomole {tm_version} — define.inp\n"
                 f"# (the control file is generated on the cluster\n"
                 f"#  by running:  define < define.inp)\n"
+                f"#  Dispersion correction: {dispersion}\n"
                 f"#\n"
             )
             return header + define_text
@@ -181,12 +190,14 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         State("inp-ntasks", "value"),
         State("inp-mem", "value"),
         State("inp-reservation", "value"),
+        State("dd-dispersion", "value"),
         prevent_initial_call=True,
     )
     def _submit(n, staging, job_name, cluster_name,
                 functional, basis, task, charge, mult, ri, grid,
                 aimd_steps, aimd_dt, aimd_T,
-                partition, walltime, nodes, ntasks, mem, reservation):
+                partition, walltime, nodes, ntasks, mem, reservation,
+                dispersion):
         if not n:
             return no_update, no_update
         try:
@@ -204,11 +215,14 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             local_dir = cfg.local_workdir / f"{safe_name}_{ts}"
             local_dir.mkdir(parents=True, exist_ok=False)
 
+            disp = (dispersion or "none").strip() or "none"
+
             build_control_file(
                 atoms, local_dir,
                 functional=functional, basis_set=basis, task_type=task,
                 charge=int(charge or 0), multiplicity=int(mult or 1),
                 grid=grid, use_ri=use_ri,
+                dispersion=disp,
                 aimd_steps=int(aimd_steps or 500),
                 aimd_timestep_fs=float(aimd_dt or 0.5),
                 aimd_temperature_K=float(aimd_T or 300),
@@ -239,6 +253,7 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                     functional=functional,
                     basis_set=basis,
                     use_ri=use_ri,
+                    dispersion=disp,
                 ),
                 env_setup=cluster.env_setup,
             )
@@ -253,6 +268,7 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                     "partition": sl.partition, "time": sl.time,
                     "nodes": sl.nodes, "ntasks": sl.ntasks, "mem": sl.mem,
                     "reservation": sl.reservation,
+                    "dispersion": disp,
                     "turbomole_version": cluster.turbomole_version,
                 },
             )
@@ -680,6 +696,10 @@ def _path_with_copy(cfg: AppConfig, job: dict):
     don't link directly. Instead we show the path and offer one-click
     copy to the clipboard, so the user can paste it in their file
     manager or terminal.
+
+    Note: dcc.Clipboard prioritizes `target_id` over `content`. To copy
+    the FULL path (not the truncated display string), we use `content`
+    only and leave `target_id` out.
     """
     path = _best_local_path(cfg, job)
     short = path
@@ -687,24 +707,21 @@ def _path_with_copy(cfg: AppConfig, job: dict):
         # Show only the last segments so the row stays compact
         short = ".../" + "/".join(path.split("/")[-2:])
 
-    target_id = {"type": "copy-path-target", "id": str(job["id"])}
-    btn_id    = {"type": "copy-path-btn",    "id": str(job["id"])}
+    btn_id = {"type": "copy-path-btn", "id": str(job["id"])}
 
     return html.Span(
         [
             html.Code(
                 short,
-                id=target_id,
-                # Full path on hover via native browser tooltip
+                # Full path visible on hover via native browser tooltip
                 title=path,
                 className="small me-1",
                 style={"userSelect": "all"},
             ),
             dcc.Clipboard(
-                target_id=target_id,
                 content=path,
                 id=btn_id,
-                title="Copy path to clipboard",
+                title="Copy full path to clipboard",
                 style={"display": "inline-block", "cursor": "pointer",
                        "verticalAlign": "middle", "fontSize": "0.9rem"},
             ),
@@ -903,17 +920,21 @@ def _build_detail_body(cfg: AppConfig, job: dict) -> html.Div:
     ))
 
     # ----- Calculation parameters -----
-    rows.append(_section_card(
-        "Calculation",
-        [
-            _kv("Task", job["task_type"]),
-            _kv("Functional", job.get("functional") or "—"),
-            _kv("Basis", job.get("basis_set") or "—"),
-            _kv("Charge", job.get("charge", 0)),
-            _kv("Multiplicity", job.get("multiplicity", 1)),
-            _kv("Turbomole version", sub.get("turbomole_version", "—")),
-        ],
-    ))
+    calc_items = [
+        _kv("Task", job["task_type"]),
+        _kv("Functional", job.get("functional") or "—"),
+    ]
+    # Show dispersion only when it was set to something other than "none"
+    disp = sub.get("dispersion")
+    if disp and disp != "none":
+        calc_items.append(_kv("Dispersion", disp))
+    calc_items.extend([
+        _kv("Basis", job.get("basis_set") or "—"),
+        _kv("Charge", job.get("charge", 0)),
+        _kv("Multiplicity", job.get("multiplicity", 1)),
+        _kv("Turbomole version", sub.get("turbomole_version", "—")),
+    ])
+    rows.append(_section_card("Calculation", calc_items))
 
     # ----- Resources requested -----
     res_items = [
@@ -947,6 +968,34 @@ def _build_detail_body(cfg: AppConfig, job: dict) -> html.Div:
         items.insert(0, html.Div(source_note,
                                  className="small text-muted mb-2"))
         rows.append(_section_card("Results", items))
+
+    # ----- Vibrational analysis (only for frequencies tasks) -----
+    if job["task_type"] == "frequencies":
+        vib = _gather_aoforce(cfg, job)
+        if vib is None:
+            rows.append(_section_card(
+                "Vibrational analysis",
+                [html.Div(
+                    html.Em("aoforce has not produced output yet, or no "
+                            "aoforce.out file is available."),
+                    className="text-muted small")],
+            ))
+        else:
+            vib_summary, vib_source = vib
+            items = [_kv(k, v) for k, v in vib_summary.as_display_dict().items()]
+            if not items:
+                items = [html.Em("Could not parse aoforce.out yet.")]
+            items.insert(0, html.Div(vib_source,
+                                     className="small text-muted mb-2"))
+            # Highlight imaginary modes if present
+            if vib_summary.n_imaginary and vib_summary.n_imaginary > 0:
+                items.append(html.Div(
+                    [html.I(className="bi bi-exclamation-triangle me-2"),
+                     f"This structure is NOT a minimum — "
+                     f"{vib_summary.n_imaginary} imaginary mode(s) detected."],
+                    className="alert alert-warning py-2 mt-2 mb-0 small",
+                ))
+            rows.append(_section_card("Vibrational analysis", items))
 
     # ----- Files -----
     files = _gather_files(cfg, job)
@@ -1063,6 +1112,43 @@ def _find_local_ridft(cfg: AppConfig, job: dict) -> Path | None:
         candidate = entry / "ridft.out"
         if candidate.exists():
             return candidate
+    return None
+
+
+def _find_local_aoforce(cfg: AppConfig, job: dict) -> Path | None:
+    """Look for an aoforce.out among the downloaded folders of this job."""
+    prefix = f"job_{job['id']}_{job['name']}"
+    for entry in sorted(cfg.download_dir.glob(f"{prefix}*"), reverse=True):
+        candidate = entry / "aoforce.out"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _gather_aoforce(cfg: AppConfig, job: dict) -> tuple[AoforceSummary, str] | None:
+    """Try to obtain a parsed AoforceSummary, either from local download
+    or via a remote tail. Returns (summary, source_label) or None."""
+    local = _find_local_aoforce(cfg, job)
+    if local and local.exists():
+        return parse_aoforce(local), "Parsed from local aoforce.out."
+
+    if job["state"] in ("RUNNING", "COMPLETED", "FAILED", "CLEANED"):
+        cluster = cfg.clusters.get(job["cluster"])
+        if cluster is None:
+            return None
+        try:
+            # aoforce output is bigger than ridft because of mode listings;
+            # 1000 lines is enough for thermochemistry + lowest freqs.
+            tail = ssh_client.read_remote_file_tail(
+                cluster, f"{job['remote_dir']}/aoforce.out", n_lines=1000,
+            )
+        except Exception as exc:
+            log.warning("Remote tail of aoforce.out failed for job %s: %s",
+                        job["id"], exc)
+            return None
+        if tail.strip():
+            return (parse_aoforce(tail),
+                    "Parsed from remote aoforce.out (last 1000 lines).")
     return None
 
 
@@ -1310,3 +1396,303 @@ def _register_db_inspector_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         except Exception as exc:
             log.exception("VACUUM failed")
             return {"ok": False, "msg": f"VACUUM failed: {exc}", "ts": time.time()}
+
+
+# ===========================================================================
+# Protocols — save/load/delete/reset
+# ===========================================================================
+#
+# A "protocol" is the New job form state minus the molecular structure,
+# persisted to ~/.turbomole_orchestrator/protocols/<name>.json so users can
+# reuse calculation setups across molecules.
+#
+# These callbacks orchestrate four user actions:
+#   * dropdown change   -> load values from the chosen JSON
+#   * Save as...        -> open modal, capture name+description, write JSON
+#   * Delete            -> delete the JSON of the currently-selected protocol
+#                          (reuses the global confirm-modal for safety)
+#   * Reset             -> repopulate every field with hardcoded defaults
+# ---------------------------------------------------------------------------
+
+def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
+
+    # ----- Populate dropdown options ---------------------------------------
+    @app.callback(
+        Output("dd-protocol", "options"),
+        Input("protocols-version", "data"),
+        Input("main-tabs", "active_tab"),
+    )
+    def _populate_protocols_dropdown(_version, _active_tab):
+        items = proto_mod.list_protocols(cfg.protocols_dir)
+        return [
+            {"label": p["name"], "value": p["path"],
+             "title": p.get("description", "")}
+            for p in items
+        ]
+
+    # ----- Enable / disable Delete button ----------------------------------
+    @app.callback(
+        Output("btn-proto-delete", "disabled"),
+        Input("dd-protocol", "value"),
+    )
+    def _toggle_delete_btn(selected_path):
+        return not selected_path
+
+    # ----- Load values from a selected protocol ----------------------------
+    @app.callback(
+        Output("dd-functional",    "value", allow_duplicate=True),
+        Output("dd-basis",         "value", allow_duplicate=True),
+        Output("chk-ri",           "value", allow_duplicate=True),
+        Output("dd-grid",          "value", allow_duplicate=True),
+        Output("dd-dispersion",    "value", allow_duplicate=True),
+        Output("rad-task",         "value", allow_duplicate=True),
+        Output("inp-charge",       "value", allow_duplicate=True),
+        Output("inp-mult",         "value", allow_duplicate=True),
+        Output("inp-aimd-steps",   "value", allow_duplicate=True),
+        Output("inp-aimd-dt",      "value", allow_duplicate=True),
+        Output("inp-aimd-T",       "value", allow_duplicate=True),
+        Output("dd-cluster",       "value", allow_duplicate=True),
+        Output("inp-partition",    "value", allow_duplicate=True),
+        Output("inp-walltime",     "value", allow_duplicate=True),
+        Output("inp-nodes",        "value", allow_duplicate=True),
+        Output("inp-ntasks",       "value", allow_duplicate=True),
+        Output("inp-mem",          "value", allow_duplicate=True),
+        Output("inp-reservation",  "value", allow_duplicate=True),
+        Output("last-action",      "data",  allow_duplicate=True),
+        Input("dd-protocol", "value"),
+        Input("btn-proto-reset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _apply_protocol_or_reset(selected_path, reset_n):
+        """Fired either by selecting a protocol in the dropdown OR by
+        clicking Reset. We branch on `ctx.triggered_id` to know which."""
+        trig = ctx.triggered_id
+
+        first_cluster = next(iter(cfg.clusters.keys()), None)
+        N_OUTPUTS = 18   # outputs above (without last-action)
+
+        if trig == "btn-proto-reset":
+            payload = proto_mod.defaults_payload(first_cluster=first_cluster)
+            feedback = {"ok": True,
+                        "msg": "Form reset to defaults.",
+                        "ts": time.time()}
+        elif trig == "dd-protocol":
+            if not selected_path:
+                return tuple([no_update] * N_OUTPUTS + [no_update])
+            try:
+                payload = proto_mod.load_protocol(Path(selected_path))
+            except Exception as exc:
+                log.exception("Loading protocol failed")
+                return tuple([no_update] * N_OUTPUTS + [{
+                    "ok": False,
+                    "msg": f"Could not load protocol: {exc}",
+                    "ts": time.time(),
+                }])
+            cl_saved = payload["submission"].get("cluster")
+            warn = ""
+            if cl_saved and cl_saved not in cfg.clusters:
+                payload["submission"]["cluster"] = first_cluster
+                warn = f" Cluster '{cl_saved}' is no longer configured; using default."
+            feedback = {
+                "ok": not warn,
+                "msg": f"Loaded protocol '{payload.get('name', '?')}'." + warn,
+                "ts": time.time(),
+            }
+        else:
+            return tuple([no_update] * N_OUTPUTS + [no_update])
+
+        method = payload["method"]
+        task = payload["task"]
+        sub = payload["submission"]
+
+        ri_value = ["ri"] if method.get("use_ri") else []
+
+        return (
+            method.get("functional"),
+            method.get("basis_set"),
+            ri_value,
+            method.get("grid"),
+            method.get("dispersion", "none"),
+            task.get("type"),
+            task.get("charge"),
+            task.get("multiplicity"),
+            task.get("aimd_steps"),
+            task.get("aimd_timestep_fs"),
+            task.get("aimd_temperature_K"),
+            sub.get("cluster") or first_cluster,
+            sub.get("partition") or "",
+            sub.get("walltime") or "",
+            sub.get("nodes"),
+            sub.get("ntasks"),
+            sub.get("mem") or "",
+            sub.get("reservation") or "",
+            feedback,
+        )
+
+    # ----- Save protocol: open modal ---------------------------------------
+    @app.callback(
+        Output("proto-save-modal", "is_open", allow_duplicate=True),
+        Output("inp-proto-name", "value"),
+        Output("inp-proto-description", "value"),
+        Output("save-proto-warning", "children"),
+        Input("btn-proto-save", "n_clicks"),
+        Input("btn-proto-save-cancel", "n_clicks"),
+        State("proto-save-modal", "is_open"),
+        prevent_initial_call=True,
+    )
+    def _toggle_save_modal(_open_n, _cancel_n, currently_open):
+        trig = ctx.triggered_id
+        if trig == "btn-proto-save":
+            return True, "", "", ""
+        # Cancel
+        return False, no_update, no_update, no_update
+
+    # ----- Save protocol: persist on OK ------------------------------------
+    @app.callback(
+        Output("proto-save-modal",    "is_open", allow_duplicate=True),
+        Output("protocols-version",   "data"),
+        Output("dd-protocol",         "value",   allow_duplicate=True),
+        Output("save-proto-warning",  "children", allow_duplicate=True),
+        Output("last-action",         "data",    allow_duplicate=True),
+        Input("btn-proto-save-ok", "n_clicks"),
+        State("inp-proto-name", "value"),
+        State("inp-proto-description", "value"),
+        # All the New-job form values:
+        State("dd-functional",   "value"),
+        State("dd-basis",        "value"),
+        State("chk-ri",          "value"),
+        State("dd-grid",         "value"),
+        State("dd-dispersion",   "value"),
+        State("rad-task",        "value"),
+        State("inp-charge",      "value"),
+        State("inp-mult",        "value"),
+        State("inp-aimd-steps",  "value"),
+        State("inp-aimd-dt",     "value"),
+        State("inp-aimd-T",      "value"),
+        State("dd-cluster",      "value"),
+        State("inp-partition",   "value"),
+        State("inp-walltime",    "value"),
+        State("inp-nodes",       "value"),
+        State("inp-ntasks",      "value"),
+        State("inp-mem",         "value"),
+        State("inp-reservation", "value"),
+        State("protocols-version", "data"),
+        prevent_initial_call=True,
+    )
+    def _save_protocol(n, name, description,
+                       functional, basis, ri, grid, dispersion,
+                       task, charge, mult,
+                       aimd_steps, aimd_dt, aimd_T,
+                       cluster, partition, walltime,
+                       nodes, ntasks, mem, reservation,
+                       version):
+        if not n:
+            return no_update, no_update, no_update, no_update, no_update
+        if not name or not name.strip():
+            warn = dbc.Alert("Please enter a protocol name.",
+                             color="warning", className="py-2 mb-0 small")
+            return no_update, no_update, no_update, warn, no_update
+
+        method = {
+            "functional": functional,
+            "basis_set":  basis,
+            "use_ri":     "ri" in (ri or []),
+            "grid":       grid,
+            "dispersion": dispersion or "none",
+        }
+        task_d = {
+            "type":               task,
+            "charge":             int(charge or 0),
+            "multiplicity":       int(mult or 1),
+            "aimd_steps":         int(aimd_steps or 500),
+            "aimd_timestep_fs":   float(aimd_dt or 0.5),
+            "aimd_temperature_K": float(aimd_T or 300),
+        }
+        submission = {
+            "cluster":     cluster,
+            "partition":   partition or "",
+            "walltime":    walltime or "",
+            "nodes":       int(nodes) if nodes is not None else None,
+            "ntasks":      int(ntasks) if ntasks is not None else None,
+            "mem":         mem or "",
+            "reservation": (reservation or "").strip(),
+        }
+        try:
+            path = proto_mod.save_protocol(
+                cfg.protocols_dir, name, description or "",
+                method, task_d, submission, overwrite=True,
+            )
+        except Exception as exc:
+            log.exception("save_protocol failed")
+            return no_update, no_update, no_update, dbc.Alert(
+                f"Save failed: {exc}", color="danger",
+                className="py-2 mb-0 small"
+            ), no_update
+
+        return (
+            False,
+            (version or 0) + 1,        # bump → dropdown re-populates
+            str(path),                 # select the just-saved protocol
+            "",
+            {"ok": True,
+             "msg": f"Protocol '{name}' saved.",
+             "ts": time.time()},
+        )
+
+    # ----- Delete protocol: reuse global confirm-modal ---------------------
+    @app.callback(
+        Output("confirm-modal",     "is_open",  allow_duplicate=True),
+        Output("confirm-modal-body", "children", allow_duplicate=True),
+        Output("pending-action",    "data",     allow_duplicate=True),
+        Input("btn-proto-delete", "n_clicks"),
+        State("dd-protocol", "value"),
+        prevent_initial_call=True,
+    )
+    def _ask_delete_protocol(n, selected_path):
+        if not n or not selected_path:
+            return no_update, no_update, no_update
+        body = [
+            html.P([
+                "Delete protocol ",
+                html.Code(Path(selected_path).name),
+                "?",
+            ]),
+            html.P("This is permanent. The JSON file will be removed.",
+                   className="text-danger mb-0 small"),
+        ]
+        return True, body, {"action": "delete-protocol", "path": selected_path}
+
+    # The confirm-modal's OK button already lives in
+    # _register_jobs_table_callbacks._resolve_confirm. To avoid touching
+    # that callback (and risk an Output conflict), we listen to the *same*
+    # OK button here, react ONLY when the pending action is ours, and just
+    # delete the file + bump the version. The other callback's branches
+    # don't fire because `action != delete-remote/clean-job`.
+    @app.callback(
+        Output("protocols-version", "data", allow_duplicate=True),
+        Output("dd-protocol", "value",      allow_duplicate=True),
+        Output("last-action", "data",       allow_duplicate=True),
+        Input("btn-confirm-ok", "n_clicks"),
+        State("pending-action", "data"),
+        State("protocols-version", "data"),
+        prevent_initial_call=True,
+    )
+    def _perform_delete_protocol(_n, pending, version):
+        if not pending or pending.get("action") != "delete-protocol":
+            return no_update, no_update, no_update
+        path = pending.get("path")
+        ok = proto_mod.delete_protocol(Path(path)) if path else False
+        if ok:
+            return (
+                (version or 0) + 1,
+                None,
+                {"ok": True,
+                 "msg": f"Protocol '{Path(path).stem}' deleted.",
+                 "ts": time.time()},
+            )
+        return (
+            no_update, no_update,
+            {"ok": False,
+             "msg": "Could not delete protocol.",
+             "ts": time.time()},
+        )

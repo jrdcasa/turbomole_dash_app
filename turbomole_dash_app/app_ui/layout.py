@@ -24,12 +24,14 @@ def build_layout(cfg: AppConfig) -> html.Div:
                     dcc.Store(id="pending-action"),
                     dcc.Store(id="tab-visited", data={}),
                     dcc.Store(id="active-ops", data={}),       # in-flight uploads/downloads
+                    dcc.Store(id="protocols-version", data=0), # bumped to force dropdown refresh
                     dcc.Interval(id="active-ops-tick",
-                                 interval=2000,                # 2 s
-                                 disabled=True,                # off until needed
+                                 interval=2000,
+                                 disabled=True,
                                  n_intervals=0),
                     _confirm_modal(),
                     _job_detail_modal(),
+                    _save_protocol_modal(),
                     dbc.Tabs(
                         [
                             dbc.Tab(_tab_new_job(cfg),  label="New job",     tab_id="tab-new"),
@@ -128,11 +130,134 @@ def _job_detail_modal() -> dbc.Modal:
 # Tab 1 — New job
 # ---------------------------------------------------------------------------
 
+def _protocols_bar(cfg: AppConfig) -> dbc.Card:
+    """Top bar of the New job tab: load / save / delete protocols, plus
+    a reset-to-defaults button."""
+    return dbc.Card(
+        dbc.CardBody(
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            dbc.Label("Protocol",
+                                      className="small text-muted mb-1"),
+                            dcc.Dropdown(
+                                id="dd-protocol",
+                                placeholder="-- select a saved protocol to load --",
+                                clearable=True,
+                            ),
+                        ],
+                        md=7,
+                    ),
+                    dbc.Col(
+                        html.Div(
+                            [
+                                dbc.Button(
+                                    [html.I(className="bi bi-floppy me-1"),
+                                     "Save as..."],
+                                    id="btn-proto-save",
+                                    color="primary",
+                                    outline=True,
+                                    size="sm",
+                                    className="me-1",
+                                ),
+                                dbc.Button(
+                                    [html.I(className="bi bi-trash me-1"),
+                                     "Delete"],
+                                    id="btn-proto-delete",
+                                    color="danger",
+                                    outline=True,
+                                    size="sm",
+                                    disabled=True,    # enabled once a protocol is selected
+                                    className="me-1",
+                                ),
+                                dbc.Button(
+                                    [html.I(className="bi bi-arrow-counterclockwise me-1"),
+                                     "Reset"],
+                                    id="btn-proto-reset",
+                                    color="secondary",
+                                    outline=True,
+                                    size="sm",
+                                ),
+                                dbc.Tooltip(
+                                    "Save the current parameters as a reusable "
+                                    "protocol (JSON). The molecular structure is "
+                                    "not part of the protocol.",
+                                    target="btn-proto-save",
+                                    delay={"show": 400, "hide": 100},
+                                ),
+                                dbc.Tooltip(
+                                    "Delete the selected protocol from disk.",
+                                    target="btn-proto-delete",
+                                    delay={"show": 400, "hide": 100},
+                                ),
+                                dbc.Tooltip(
+                                    "Reset all fields to their factory defaults.",
+                                    target="btn-proto-reset",
+                                    delay={"show": 400, "hide": 100},
+                                ),
+                            ],
+                            className="d-flex align-items-end h-100 pb-1",
+                        ),
+                        md=5,
+                    ),
+                ],
+                className="g-2 align-items-end",
+            ),
+        ),
+        className="shadow-sm mt-3",
+    )
+
+
+def _save_protocol_modal() -> dbc.Modal:
+    """Modal asking for protocol name and optional description before
+    persisting the current form state as a JSON protocol."""
+    return dbc.Modal(
+        [
+            dbc.ModalHeader(
+                dbc.ModalTitle(
+                    [html.I(className="bi bi-floppy me-2"),
+                     "Save protocol"]
+                ),
+            ),
+            dbc.ModalBody(
+                [
+                    dbc.Label("Protocol name"),
+                    dbc.Input(
+                        id="inp-proto-name",
+                        placeholder="e.g. DFT opt organometallics",
+                        autoFocus=True,
+                    ),
+                    dbc.Label("Description (optional)", className="mt-3"),
+                    dbc.Textarea(
+                        id="inp-proto-description",
+                        placeholder="Anything that helps you recognize this protocol later",
+                        rows=2,
+                    ),
+                    html.Div(id="save-proto-warning", className="mt-2"),
+                ],
+            ),
+            dbc.ModalFooter(
+                [
+                    dbc.Button("Cancel", id="btn-proto-save-cancel",
+                               color="secondary", outline=True),
+                    dbc.Button("Save", id="btn-proto-save-ok", color="primary"),
+                ]
+            ),
+        ],
+        id="proto-save-modal",
+        is_open=False,
+        backdrop="static",
+        centered=True,
+    )
+
+
 def _tab_new_job(cfg: AppConfig) -> html.Div:
     cluster_options = [{"label": c, "value": c} for c in cfg.clusters.keys()]
 
     return html.Div(
         [
+            _protocols_bar(cfg),
             dbc.Row(
                 [
                     dbc.Col(_card_structure(), md=6),
@@ -222,16 +347,54 @@ def _card_structure() -> dbc.Card:
 
 
 def _card_method() -> dbc.Card:
+    from backend.turbomole_io import available_dispersions
     return dbc.Card(
         dbc.CardBody(
             [
                 html.H5([html.I(className="bi bi-sliders me-2"), "Method"],
                         className="card-title"),
-                dbc.Label("Functional"),
-                dcc.Dropdown(
-                    id="dd-functional",
-                    options=[{"label": f, "value": f} for f in available_functionals()],
-                    value="BP86", clearable=False,
+                dbc.Row(
+                    [
+                        dbc.Col(
+                            [
+                                dbc.Label("Functional"),
+                                dcc.Dropdown(
+                                    id="dd-functional",
+                                    options=[{"label": f, "value": f}
+                                             for f in available_functionals()],
+                                    value="BP86", clearable=False,
+                                ),
+                            ],
+                            md=7,
+                        ),
+                        dbc.Col(
+                            [
+                                dbc.Label([
+                                    "Dispersion ",
+                                    html.Span("(optional)",
+                                              className="text-muted small"),
+                                ]),
+                                dcc.Dropdown(
+                                    id="dd-dispersion",
+                                    options=[{"label": lab, "value": val}
+                                             for val, lab in available_dispersions()],
+                                    value="none", clearable=False,
+                                ),
+                                dbc.Tooltip(
+                                    "Adds an empirical dispersion correction "
+                                    "(D3 / D3-BJ / D4) by inserting the "
+                                    "appropriate $disp* keyword into the control "
+                                    "file before ridft runs. Highly recommended "
+                                    "for non-covalent interactions, organometallics, "
+                                    "and large/flexible systems.",
+                                    target="dd-dispersion",
+                                    delay={"show": 400, "hide": 100},
+                                ),
+                            ],
+                            md=5,
+                        ),
+                    ],
+                    className="g-2",
                 ),
                 dbc.Label("Basis set", className="mt-3"),
                 dcc.Dropdown(
@@ -266,6 +429,7 @@ def _card_task() -> dbc.Card:
                     options=[
                         {"label": " Single point",       "value": "single_point"},
                         {"label": " Geometry optimization", "value": "optimization"},
+                        {"label": " Frequencies (aoforce)", "value": "frequencies"},
                         {"label": " Ab initio MD (frog)", "value": "aimd"},
                     ],
                     value="single_point",

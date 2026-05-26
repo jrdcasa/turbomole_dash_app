@@ -30,7 +30,7 @@ SUPPORTED_INPUT_FORMATS = (
     "xyz", "coord", "mol", "mol2", "pdb", "sdf", "cif", "gen", "vasp", "cml",
 )
 
-TASK_TYPES = ("single_point", "optimization", "aimd")
+TASK_TYPES = ("single_point", "optimization", "aimd", "frequencies")
 
 SUPPORTED_TM_VERSIONS = ("7.8", "8.0")
 
@@ -62,6 +62,17 @@ _BASIS_SETS = (
     "aug-cc-pVDZ","aug-cc-pVTZ",
 )
 
+# Dispersion corrections.
+# Each entry maps a UI value to (control_keyword, display_label).
+# control_keyword is the exact line we add to the `control` file before
+# $end. None means "no correction" (we skip the insertion entirely).
+DISPERSION_OPTIONS = {
+    "none":  (None,        "None"),
+    "d3":    ("$disp3",    "D3 (zero damping)"),
+    "d3bj":  ("$disp3 bj", "D3(BJ) — Becke-Johnson damping"),
+    "d4":    ("$disp4",    "D4"),
+}
+
 
 def available_functionals() -> list[str]:
     return list(_RIDFT_FUNCTIONALS.keys())
@@ -69,6 +80,11 @@ def available_functionals() -> list[str]:
 
 def available_basis_sets() -> list[str]:
     return list(_BASIS_SETS)
+
+
+def available_dispersions() -> list[tuple[str, str]]:
+    """List of (value, label) tuples for the UI dropdown."""
+    return [(k, v[1]) for k, v in DISPERSION_OPTIONS.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +126,7 @@ class CalcSpec:
     scf_iter: int = 200
     grid: str = "m4"         # m3 | m4 | m5
     use_ri: bool = True
+    dispersion: str = "none" # none | d3 | d3bj | d4
     # AIMD-specific
     aimd_steps: int = 500
     aimd_timestep_fs: float = 0.5
@@ -124,6 +141,11 @@ class CalcSpec:
             raise ValueError(f"Unknown basis set {self.basis_set!r}")
         if self.multiplicity < 1:
             raise ValueError(f"multiplicity must be >= 1, got {self.multiplicity}")
+        if self.dispersion not in DISPERSION_OPTIONS:
+            raise ValueError(
+                f"Unknown dispersion {self.dispersion!r}. "
+                f"Allowed: {list(DISPERSION_OPTIONS.keys())}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +178,27 @@ class DefineDriver(ABC):
         return lines + [""] * n
 
 
+def _disp_injection_commands(spec: CalcSpec) -> list[str]:
+    """Return shell lines that add the dispersion keyword to `control`.
+
+    `define` does not write $disp* entries on its own (the keywords are
+    handled at runtime by ridft via DFT-D3/D4 libraries). We insert them
+    right before $end so they take effect on the next ridft/jobex run.
+    """
+    keyword = DISPERSION_OPTIONS[spec.dispersion][0]
+    if keyword is None:
+        return []
+    return [
+        f'# 1b) Add dispersion correction ({spec.dispersion}) to control',
+        # Idempotent: skip if already present
+        f'if ! grep -q "^{keyword}\\b" control; then',
+        # Insert keyword on its own line just before the $end line
+        f'    sed -i "/^\\$end$/i {keyword}" control',
+        'fi',
+        '',
+    ]
+
+
 class DefineDriver_7_8(DefineDriver):
     """
     Driver for Turbomole 7.8.x.
@@ -180,7 +223,6 @@ class DefineDriver_7_8(DefineDriver):
 
         # --- title menu ---
         lines += [
-            "",                          # title: just press Enter
             "",                          # title: just press Enter
             "a coord",                   # add geometry from coord file
             "*",                         # exit geometry submenu
@@ -228,10 +270,8 @@ class DefineDriver_7_8(DefineDriver):
         # --- SCF ---
         lines += [
             "scf",
-            "conv",
-            f"{spec.scf_conv}",
-            "iter",
-            f"{spec.scf_iter}",
+            f"conv {spec.scf_conv}",
+            f"iter {spec.scf_iter}",
             "",                          # back to main
         ]
 
@@ -252,6 +292,8 @@ class DefineDriver_7_8(DefineDriver):
             "fi",
             "",
         ]
+        common_pre += _disp_injection_commands(spec)
+
         if spec.task_type == "single_point":
             return common_pre + [
                 "# 2) Single-point energy --------------------------------",
@@ -261,6 +303,15 @@ class DefineDriver_7_8(DefineDriver):
             return common_pre + [
                 "# 2) Geometry optimization ------------------------------",
                 "jobex -ri -c 200 > jobex.out 2>&1",
+            ]
+        if spec.task_type == "frequencies":
+            # aoforce needs converged MOs (`mos` file). Run ridft first
+            # so we have a guaranteed SCF point at the input geometry.
+            return common_pre + [
+                "# 2) SCF first (so we have converged MOs) ---------------",
+                "ridft > ridft.out 2>&1",
+                "# 3) Harmonic frequencies via aoforce -------------------",
+                "aoforce > aoforce.out 2>&1",
             ]
         if spec.task_type == "aimd":
             return common_pre + [
@@ -275,21 +326,10 @@ class DefineDriver_7_8(DefineDriver):
 class DefineDriver_8_0(DefineDriver_7_8):
     """
     Driver for Turbomole 8.0 (anticipated).
-
-    Inherits from 7.8 because the core menu structure is unlikely to
-    change drastically. Override the methods/sections that *do* change
-    once 8.0 documentation is available.
-
-    NOTE: This is a forward-looking placeholder. When 8.0 ships:
-      - Run `define` interactively on a small case
-      - Compare its prompt sequence with 7.8
-      - Override only what differs
     """
     version = "8.0"
 
     def build_define_input(self, spec: CalcSpec) -> str:
-        # For now identical to 7.8. Once 8.0 is available and tested,
-        # override here with the actual differences.
         return super().build_define_input(spec)
 
 
@@ -300,8 +340,6 @@ _DRIVERS: dict[str, type[DefineDriver]] = {
 
 
 def get_driver(version: str) -> DefineDriver:
-    """Resolve a version string to a driver instance. Tolerates patch
-    versions like '7.8.1' by matching on the major.minor prefix."""
     if version in _DRIVERS:
         return _DRIVERS[version]()
     major_minor = ".".join(version.split(".")[:2])
@@ -330,6 +368,7 @@ def build_control_file(
     scf_iter: int = 200,
     grid: str = "m4",
     use_ri: bool = True,
+    dispersion: str = "none",
     aimd_steps: int = 500,
     aimd_timestep_fs: float = 0.5,
     aimd_temperature_K: float = 300.0,
@@ -355,6 +394,7 @@ def build_control_file(
         functional=functional, basis_set=basis_set, task_type=task_type,
         charge=charge, multiplicity=multiplicity,
         scf_conv=scf_conv, scf_iter=scf_iter, grid=grid, use_ri=use_ri,
+        dispersion=dispersion,
         aimd_steps=aimd_steps,
         aimd_timestep_fs=aimd_timestep_fs,
         aimd_temperature_K=aimd_temperature_K,
@@ -382,11 +422,12 @@ def turbomole_driver_commands(
     functional: str = "BP86",
     basis_set: str = "def2-SVP",
     use_ri: bool = True,
+    dispersion: str = "none",
 ) -> list[str]:
     """Shell commands to run inside the SLURM script body."""
     spec = CalcSpec(
         functional=functional, basis_set=basis_set, task_type=task_type,
-        use_ri=use_ri,
+        use_ri=use_ri, dispersion=dispersion,
     )
     driver = get_driver(turbomole_version)
     return driver.driver_commands(spec)

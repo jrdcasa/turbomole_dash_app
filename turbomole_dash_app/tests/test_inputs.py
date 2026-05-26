@@ -222,3 +222,111 @@ def test_slurm_script_strips_reservation_whitespace():
     txt = build_slurm_script(sl, "/scratch/me/job1", [], cmds)
     assert "#SBATCH --reservation=my_block" in txt
     assert "--reservation=  " not in txt
+
+
+# ---------------------------------------------------------------------------
+# Dispersion corrections
+# ---------------------------------------------------------------------------
+
+def test_no_dispersion_by_default():
+    """By default no $disp keyword is inserted."""
+    cmds = turbomole_driver_commands("single_point", turbomole_version="7.8")
+    joined = "\n".join(cmds)
+    assert "$disp" not in joined
+    assert "sed" not in joined
+
+
+def test_dispersion_d3_inserts_keyword():
+    cmds = turbomole_driver_commands("single_point", turbomole_version="7.8",
+                                     dispersion="d3")
+    joined = "\n".join(cmds)
+    assert "$disp3" in joined
+    assert "sed" in joined
+    # The injection must run BEFORE ridft
+    disp_idx = next(i for i, l in enumerate(cmds) if "$disp3" in l)
+    ridft_idx = next(i for i, l in enumerate(cmds) if "ridft" in l)
+    assert disp_idx < ridft_idx
+
+
+def test_dispersion_d3bj_uses_bj():
+    cmds = turbomole_driver_commands("single_point", turbomole_version="7.8",
+                                     dispersion="d3bj")
+    joined = "\n".join(cmds)
+    assert "$disp3 bj" in joined
+
+
+def test_dispersion_d4():
+    cmds = turbomole_driver_commands("single_point", turbomole_version="7.8",
+                                     dispersion="d4")
+    joined = "\n".join(cmds)
+    assert "$disp4" in joined
+
+
+def test_dispersion_idempotent_guard():
+    """The inserted shell snippet must be idempotent: grep -q guards
+    against running it twice."""
+    cmds = turbomole_driver_commands("single_point", turbomole_version="7.8",
+                                     dispersion="d3bj")
+    joined = "\n".join(cmds)
+    assert "grep -q" in joined
+    assert "fi" in joined
+
+
+def test_unknown_dispersion_raises():
+    import pytest
+    from backend.turbomole_io import CalcSpec
+    with pytest.raises(ValueError, match="Unknown dispersion"):
+        CalcSpec(functional="BP86", basis_set="def2-SVP",
+                 task_type="single_point", dispersion="d99").validate()
+
+
+def test_dispersion_applies_to_optimization_too():
+    cmds = turbomole_driver_commands("optimization", turbomole_version="7.8",
+                                     dispersion="d3bj")
+    joined = "\n".join(cmds)
+    assert "$disp3 bj" in joined
+    assert "jobex" in joined
+    # And ordering: disp insertion runs before jobex
+    disp_idx = next(i for i, l in enumerate(cmds) if "$disp3 bj" in l)
+    jobex_idx = next(i for i, l in enumerate(cmds) if "jobex" in l)
+    assert disp_idx < jobex_idx
+
+
+# ---------------------------------------------------------------------------
+# Frequencies task (aoforce)
+# ---------------------------------------------------------------------------
+
+def test_frequencies_task_runs_ridft_then_aoforce():
+    cmds = turbomole_driver_commands("frequencies", turbomole_version="7.8")
+    joined = "\n".join(cmds)
+    assert "define < define.inp" in joined
+    assert "ridft" in joined
+    assert "aoforce" in joined
+    # ridft must come before aoforce so MOs exist when aoforce runs
+    ridft_idx = next(i for i, l in enumerate(cmds) if "ridft >" in l)
+    aoforce_idx = next(i for i, l in enumerate(cmds) if "aoforce >" in l)
+    assert ridft_idx < aoforce_idx
+
+
+def test_frequencies_with_dispersion():
+    """Frequencies task + dispersion should still inject $disp* before ridft."""
+    cmds = turbomole_driver_commands("frequencies", turbomole_version="7.8",
+                                     dispersion="d3bj")
+    joined = "\n".join(cmds)
+    assert "$disp3 bj" in joined
+    assert "aoforce" in joined
+    # Order: disp_injection → ridft → aoforce
+    disp_idx = next(i for i, l in enumerate(cmds) if "$disp3 bj" in l)
+    ridft_idx = next(i for i, l in enumerate(cmds) if "ridft >" in l)
+    aoforce_idx = next(i for i, l in enumerate(cmds) if "aoforce >" in l)
+    assert disp_idx < ridft_idx < aoforce_idx
+
+
+def test_frequencies_in_full_slurm_script():
+    """End-to-end check that aoforce appears in a real submit.slurm."""
+    sl = SlurmParams(job_name="freqtest", partition="cpu",
+                     nodes=1, ntasks=8, mem="16G")
+    cmds = turbomole_driver_commands("frequencies", turbomole_version="7.8")
+    script = build_slurm_script(sl, "/scratch/me/freqtest", [], cmds)
+    assert "aoforce > aoforce.out" in script
+    assert "ridft > ridft.out" in script

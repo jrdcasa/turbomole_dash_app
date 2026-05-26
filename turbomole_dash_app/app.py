@@ -28,22 +28,22 @@ def create_app() -> dash.Dash:
     cfg = load_config()
     init_db(cfg.db_path)
 
-    app = dash.Dash(
+    app_main = dash.Dash(
         __name__,
         external_stylesheets=[dbc.themes.SLATE, dbc.icons.BOOTSTRAP],
         suppress_callback_exceptions=True,
         title="Turbomole Orchestrator",
-        update_title=None,
+        #update_title=None,
         assets_folder="assets",
     )
 
-    app.layout = build_layout(cfg)
-    register_callbacks(app, cfg)
-    return app
+    app_main.layout = build_layout(cfg)
+    register_callbacks(app_main, cfg)
+    return app_main
 
 
 app = create_app()
-server = app.server  # for gunicorn / production
+server = app.server
 
 if __name__ == "__main__":
     # debug=False so the reloader doesn't duplicate state
