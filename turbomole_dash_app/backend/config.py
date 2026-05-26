@@ -50,6 +50,8 @@ class AppConfig:
     db_path: Path = Path.home() / ".turbomole_orchestrator" / "jobs.sqlite"
     local_workdir: Path = Path.home() / ".turbomole_orchestrator" / "workspace"
     download_dir: Path = Path.home() / ".turbomole_orchestrator" / "downloads"
+    # Reusable JSON submission protocols saved from the New job tab.
+    protocols_dir: Path = Path.home() / ".turbomole_orchestrator" / "protocols"
     poll_interval_s: int = 30
     clusters: dict[str, RemoteCluster] = field(default_factory=dict)
 
@@ -58,6 +60,7 @@ def _ensure_dirs(cfg: AppConfig) -> None:
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.local_workdir.mkdir(parents=True, exist_ok=True)
     cfg.download_dir.mkdir(parents=True, exist_ok=True)
+    cfg.protocols_dir.mkdir(parents=True, exist_ok=True)
 
 
 def load_config(path: str | os.PathLike | None = None) -> AppConfig:
@@ -77,6 +80,8 @@ def load_config(path: str | os.PathLike | None = None) -> AppConfig:
         cfg.local_workdir = Path(raw["local_workdir"]).expanduser()
     if "download_dir" in raw:
         cfg.download_dir = Path(raw["download_dir"]).expanduser()
+    if "protocols_dir" in raw:
+        cfg.protocols_dir = Path(raw["protocols_dir"]).expanduser()
     if "poll_interval_s" in raw:
         cfg.poll_interval_s = int(raw["poll_interval_s"])
 

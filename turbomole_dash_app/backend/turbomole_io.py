@@ -223,6 +223,7 @@ class DefineDriver_7_8(DefineDriver):
 
         # --- title menu ---
         lines += [
+            "",
             "",                          # title: just press Enter
             "a coord",                   # add geometry from coord file
             "*",                         # exit geometry submenu

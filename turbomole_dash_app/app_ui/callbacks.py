@@ -299,7 +299,9 @@ def _upload_and_submit(cfg: AppConfig, job_id: int) -> None:
         return
     cluster = cfg.clusters[job["cluster"]]
     try:
-        ssh_client.upload_dir(cluster, Path(job["local_dir"]), job["remote_dir"])
+        # Single-tarball upload: ~1 SFTP round-trip + 1 remote `tar -xzf`
+        # instead of N round-trips for N files.
+        ssh_client.upload_dir_tar(cluster, Path(job["local_dir"]), job["remote_dir"])
         update_job(job_id, state="UPLOADED")
         slurm_id = slurm_remote.submit(cluster, job["remote_dir"], "submit.slurm")
         update_job(job_id, state="SUBMITTED", slurm_id=slurm_id)
@@ -733,7 +735,6 @@ def _path_with_copy(cfg: AppConfig, job: dict):
 # ===========================================================================
 # Action implementations
 # ===========================================================================
-
 def _action_download(cfg: AppConfig, job_id: int, *, partial: bool, clean: bool) -> None:
     job = get_job(job_id)
     if not job:
@@ -749,7 +750,10 @@ def _action_download(cfg: AppConfig, job_id: int, *, partial: bool, clean: bool)
     if partial:
         dest = dest.with_name(dest.name + "_partial_" + time.strftime("%H%M%S"))
     try:
-        ssh_client.download_dir(cluster, job["remote_dir"], dest, partial=partial)
+        # Single-tarball download: remote `tar -czf` + one SFTP transfer
+        # + local extract. For `partial=True` we tolerate files that are
+        # still being written by Turbomole.
+        ssh_client.download_dir_tar(cluster, job["remote_dir"], dest, partial=partial)
         log.info("Downloaded job %s -> %s", job_id, dest)
         if not partial:
             update_job(job_id, state="DOWNLOADED",
