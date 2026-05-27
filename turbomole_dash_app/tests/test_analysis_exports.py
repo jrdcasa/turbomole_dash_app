@@ -111,4 +111,37 @@ def test_gnuplot_escapes_quotes_in_title():
     s = gnuplot_optimization('traj.csv',
                              JobMeta(name='weird "name"',
                                      functional="HF", basis_set="def2-SVP"))
-    assert '"weird \\"name\\"' in s          # escaped properly
+    assert r'weird \"name\"' in s          # escaped properly
+
+# ---------------------------------------------------------------------------
+# SCF convergence exporters
+# ---------------------------------------------------------------------------
+
+from backend.analysis_exports import (
+    gnuplot_scf_convergence, scf_convergence_to_csv,
+)
+
+
+def test_scf_convergence_csv_header_and_diff():
+    csv_text = scf_convergence_to_csv([(1, -76.40), (2, -76.42), (3, -76.421)])
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    assert rows[0] == ["iteration", "scf_energy_Ha", "dE_vs_prev_Ha"]
+    assert rows[1][2] == ""                            # first row: no diff
+    assert abs(float(rows[2][2]) - (-0.02)) < 1e-9
+    assert abs(float(rows[3][2]) - (-0.001)) < 1e-9
+
+
+def test_scf_convergence_csv_empty():
+    csv_text = scf_convergence_to_csv([])
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    assert rows == [["iteration", "scf_energy_Ha", "dE_vs_prev_Ha"]]
+
+
+def test_gnuplot_scf_convergence_references_csv():
+    s = gnuplot_scf_convergence("foo_scf.csv",
+                                JobMeta(name="h2o", functional="BP86",
+                                        basis_set="def2-SVP"))
+    assert 'f1="foo_scf.csv"' in s
+    assert "logscale y" in s
+    assert "kcal/mol" in s
+    assert "SCF iteration" in s

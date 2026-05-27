@@ -118,7 +118,7 @@ def gnuplot_optimization(csv_filename: str, meta: JobMeta) -> str:
     return _STYLE_BLOCK + f"""\
 set term wxt 1 enhanced dashed size 600,400 font "DejaVu Sans,12"
 set multiplot layout 1,1
-set title "{title}" nonenhanced
+set title "{title}" noenhanced
 f1="{fname}"
 set datafile separator ","
 # Skip header line when computing E0 (column 2 = scf_energy_Ha)
@@ -150,7 +150,7 @@ def gnuplot_trajectory(csv_filename: str, meta: JobMeta) -> str:
     return _STYLE_BLOCK + f"""\
 set term wxt 2 enhanced dashed size 600,400 font "DejaVu Sans,12"
 set multiplot layout 1,1
-set title "{title}" nonenhanced
+set title "{title}" noenhanced
 f1="{fname}"
 set datafile separator ","
 set logscale y
@@ -173,7 +173,7 @@ def gnuplot_spectrum(csv_filename: str, meta: JobMeta) -> str:
     return _STYLE_BLOCK + f"""\
 set term wxt 1 enhanced dashed size 700,400 font "DejaVu Sans,12"
 set multiplot layout 1,1
-set title "{title}" nonenhanced
+set title "{title}" noenhanced
 f1="{fname}"
 set datafile separator ","
 # Filter out near-zero translational/rotational modes (column 3 != near_zero)
@@ -187,4 +187,60 @@ unset key
 p f1 every ::1 u 2:(1.0):(stringcolumn(3) eq "imaginary" ? 0xff7b72 : 0x58a6ff) \\
        w impulses lc rgb variable lw 2 notitle
 unset multiplot
+"""
+
+# ---------------------------------------------------------------------------
+# SCF convergence (single point, but also useful for opt/freq)
+# ---------------------------------------------------------------------------
+
+def scf_convergence_to_csv(iterations: list[tuple[int, float]]) -> str:
+    """One row per SCF iteration: index, energy, ΔE vs previous.
+
+    The CSV is portable: drop it next to the .gp script and run
+    `gnuplot *_scf.gp` to render the convergence plot.
+    """
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["iteration", "scf_energy_Ha", "dE_vs_prev_Ha"])
+    prev: float | None = None
+    for i, e in iterations:
+        de = "" if prev is None else f"{e - prev:.6e}"
+        w.writerow([i, f"{e:.10f}", de])
+        prev = e
+    return buf.getvalue()
+
+
+def gnuplot_scf_convergence(csv_filename: str, meta: JobMeta) -> str:
+    """Gnuplot script: SCF iteration vs |ΔE| (log scale).
+
+    Same idiom as the optimization plot: read E0 from the first data
+    row, plot (E - E0) * 627.5092 in kcal/mol on the left axis and the
+    log of |ΔE| (Hartree) on the right axis. Two panels stacked, sharing
+    the iteration axis.
+    """
+    title = _gnuplot_escape(meta.title("SCF convergence"))
+    fname = _gnuplot_escape(csv_filename)
+    return _STYLE_BLOCK + f"""\
+set term wxt 3 enhanced dashed size 700,500 font "DejaVu Sans,12"
+set multiplot layout 2,1 title "{title}" noenhanced
+f1="{fname}"
+set datafile separator ","
+E0=real(word(system(sprintf("sed -n '2p' %s | tr ',' ' '",f1)),2))
+conv=627.5092
+# --- top panel: relative energy in kcal/mol --------------------------------
+set xlabel ""
+set ylabel "{{/Symbol D}}E (kcal/mol)" font "Arial, 12"
+set format x ""
+set grid
+unset key
+p f1 every ::1 u 1:(($2-E0)*conv) w lp ls 1 notitle
+# --- bottom panel: |dE| step on log scale ----------------------------------
+set xlabel "SCF iteration" font "Arial, 12"
+set ylabel "|{{/Symbol D}}E_{{step}}| (Ha)" font "Arial, 12"
+set format x "%.0f"
+set format y "10^{{%T}}"
+set logscale y
+p f1 every ::2 u 1:(abs($3)) w lp ls 2 notitle
+unset multiplot
+unset logscale y
 """

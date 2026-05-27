@@ -46,6 +46,17 @@ _AOFORCE = """
    frequency      1592.34  3742.56  3851.12
 """
 
+_RIDFT_FULL = """\
+ ITERATION  ENERGY          1e-ENERGY        2e-ENERGY     NORM[dD(SAO)]  TOL
+   1  -76.4000000000    -123.4500000000     46.0000000000    0.000D+00 0.296D-10
+                            Exc = -10.0
+ ITERATION  ENERGY          1e-ENERGY        2e-ENERGY     NORM[dD(SAO)]  TOL
+   2  -76.4200000000    -123.4600000000     46.0100000000    0.259D-03 0.188D-10
+ ITERATION  ENERGY          1e-ENERGY        2e-ENERGY     NORM[dD(SAO)]  TOL
+   3  -76.4235212345    -123.4650000000     46.0150000000    0.331D-04 0.176D-10
+  convergence criteria satisfied after  3 iterations
+       total energy      =   -76.42352123450 |
+"""
 
 def _job(task: str, name: str = "h2o") -> dict:
     return {"id": 1, "name": name, "task_type": task,
@@ -124,3 +135,32 @@ def test_writer_overwrites_previous_run(tmp_path):
     text = csv_path.read_text()
     assert text != "STALE"
     assert text.startswith("cycle,")
+
+def test_single_point_writes_scf_convergence(tmp_path):
+    (tmp_path / "ridft.out").write_text(_RIDFT_FULL)
+    result = write_artifacts(_job("single_point"), tmp_path)
+    names = sorted(p.name for p in result.files)
+    assert "h2o_singlepoint.csv" in names
+    assert "h2o_scf_convergence.csv" in names
+    assert "h2o_scf.gp" in names
+
+
+def test_optimization_also_writes_singlepoint_and_scf(tmp_path):
+    (tmp_path / "energy").write_text(_ENERGY)
+    (tmp_path / "gradient").write_text(_GRADIENT)
+    (tmp_path / "ridft.out").write_text(_RIDFT_FULL)
+    result = write_artifacts(_job("optimization"), tmp_path)
+    names = sorted(p.name for p in result.files)
+    assert "h2o_singlepoint.csv" in names
+    assert "h2o_scf_convergence.csv" in names
+    assert "h2o_trajectory.csv" in names
+
+
+def test_frequencies_also_writes_singlepoint_and_scf(tmp_path):
+    (tmp_path / "aoforce.out").write_text(_AOFORCE)
+    (tmp_path / "ridft.out").write_text(_RIDFT_FULL)
+    result = write_artifacts(_job("frequencies"), tmp_path)
+    names = sorted(p.name for p in result.files)
+    assert "h2o_spectrum.csv" in names
+    assert "h2o_singlepoint.csv" in names
+    assert "h2o_scf_convergence.csv" in names

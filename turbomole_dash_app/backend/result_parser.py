@@ -433,3 +433,35 @@ def parse_aoforce(source: str | Path) -> AoforceSummary:
                 pass
 
     return s
+
+# ===========================================================================
+# SCF iteration parser (per-cycle energies from ridft.out)
+# ===========================================================================
+
+# Matches the per-iteration energy line that follows the "ITERATION ENERGY"
+# header in ridft.out. Example:
+#    1  -7401.0407959107    -40945.416506     18159.243113    0.000D+00 0.296D-10
+# We anchor on: optional leading spaces, integer iteration index, then a
+# float (the total SCF energy in Hartree). Subsequent columns are ignored.
+_RE_SCF_ITER = re.compile(
+    r"^\s*(\d+)\s+(-?\d+\.\d+)\s+-?\d+\.\d+\s+-?\d+\.\d+\s+"
+    r"-?\d+\.\d+[DdEe][+-]?\d+",
+    re.MULTILINE,
+)
+
+
+def parse_scf_iterations(source: str | Path) -> list[tuple[int, float]]:
+    """Extract (iteration, total_energy_Ha) pairs from a ridft.out file.
+
+    Returns a chronologically ordered list. Duplicate iteration numbers
+    (e.g. SCF restarted after grid refinement) are kept as-is so the
+    caller can see the full trajectory.
+    """
+    text = _read_text(source)
+    out: list[tuple[int, float]] = []
+    for m in _RE_SCF_ITER.finditer(text):
+        try:
+            out.append((int(m.group(1)), float(m.group(2))))
+        except ValueError:
+            continue
+    return out

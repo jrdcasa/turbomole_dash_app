@@ -37,7 +37,7 @@ from backend.analysis_writer import ArtifactSet, write_artifacts
 from backend.config import AppConfig
 from backend.db import list_jobs
 from backend.opt_trajectory import OptTrajectory, load_trajectory
-from backend.result_parser import parse_aoforce, parse_ridft
+from backend.result_parser import parse_aoforce, parse_ridft, parse_scf_iterations
 
 
 log = logging.getLogger("analysis")
@@ -224,10 +224,13 @@ def _resolve_local_dir(cfg: AppConfig, job: dict) -> Path | None:
 def _view_optimization(job: dict, local_dir: Path) -> html.Div:
     traj = load_trajectory(local_dir)
     if traj.n_cycles == 0:
-        return dbc.Alert(
-            "No `energy` / `gradient` data found in the downloaded directory.",
-            color="warning",
-        )
+        return html.Div([
+            dbc.Alert(
+                "No `energy` / `gradient` data found in the downloaded directory.",
+                color="warning",
+            ),
+            _ridft_summary_block(local_dir),
+        ])
 
     energy_card = dbc.Card(
         dbc.CardBody(
@@ -264,10 +267,13 @@ def _view_optimization(job: dict, local_dir: Path) -> html.Div:
         className="shadow-sm",
     )
 
-    return dbc.Row(
-        [dbc.Col(energy_card, md=8), dbc.Col(conv_card, md=4)],
-        className="g-3 mt-1",
-    )
+    return html.Div([
+        dbc.Row(
+            [dbc.Col(energy_card, md=8), dbc.Col(conv_card, md=4)],
+            className="g-3 mt-1",
+        ),
+        _ridft_summary_block(local_dir),
+    ])
 
 
 def _view_single_point(job: dict, local_dir: Path) -> html.Div:
@@ -275,31 +281,24 @@ def _view_single_point(job: dict, local_dir: Path) -> html.Div:
     if not ridft.exists():
         return dbc.Alert("No ridft.out in the downloaded directory.",
                          color="warning")
-    summary = parse_ridft(ridft)
-    items = [_kv(k, v) for k, v in summary.as_display_dict().items()]
-    if not items:
-        items = [html.Em("ridft.out present but no parseable fields.")]
-    return dbc.Card(
-        dbc.CardBody(
-            [
-                html.H5([html.I(className="bi bi-lightning-charge me-2"),
-                         "Single-point results"], className="card-title"),
-                html.Div(items),
-            ]
-        ),
-        className="shadow-sm",
-    )
+    return _ridft_summary_block(local_dir)
 
 
 def _view_frequencies(job: dict, local_dir: Path) -> html.Div:
     aoforce = local_dir / "aoforce.out"
     if not aoforce.exists():
-        return dbc.Alert("No aoforce.out in the downloaded directory.",
-                         color="warning")
+        return html.Div([
+            dbc.Alert("No aoforce.out in the downloaded directory.",
+                      color="warning"),
+            _ridft_summary_block(local_dir),
+        ])
     summary = parse_aoforce(aoforce)
     if not summary.frequencies_cm1:
-        return dbc.Alert("aoforce.out present but no frequencies parsed.",
-                         color="warning")
+        return html.Div([
+            dbc.Alert("aoforce.out present but no frequencies parsed.",
+                      color="warning"),
+            _ridft_summary_block(local_dir),
+        ])
 
     items = [_kv(k, v) for k, v in summary.as_display_dict().items()]
     n_imag = summary.n_imaginary or 0
@@ -347,6 +346,7 @@ def _view_frequencies(job: dict, local_dir: Path) -> html.Div:
                 ],
                 className="g-3 mt-1",
             ),
+            _ridft_summary_block(local_dir),
         ]
     )
 
@@ -364,6 +364,98 @@ def _view_aimd(job: dict, local_dir: Path) -> html.Div:
         ),
         className="shadow-sm",
     )
+
+# ---------------------------------------------------------------------------
+# Shared SCF / ridft summary block
+# ---------------------------------------------------------------------------
+
+def _ridft_summary_block(local_dir: Path) -> html.Div:
+    """Render the parsed ridft.out summary + an inline SCF convergence
+    chart. Reused across single_point, optimization and frequencies."""
+    ridft = local_dir / "ridft.out"
+    if not ridft.exists():
+        return html.Div()
+
+    summary = parse_ridft(ridft)
+    items = [_kv(k, v) for k, v in summary.as_display_dict().items()]
+    if not items:
+        items = [html.Em("ridft.out present but no parseable fields.")]
+
+    summary_card = dbc.Card(
+        dbc.CardBody(
+            [
+                html.H5([html.I(className="bi bi-lightning-charge me-2"),
+                         "Single-point results"], className="card-title"),
+                html.Div(items),
+            ]
+        ),
+        className="shadow-sm",
+    )
+
+    iters = parse_scf_iterations(ridft)
+    if len(iters) >= 2:
+        scf_card = dbc.Card(
+            dbc.CardBody(
+                [
+                    html.H5([html.I(className="bi bi-activity me-2"),
+                             "SCF convergence"], className="card-title"),
+                    dcc.Graph(figure=_build_scf_figure(iters),
+                              config={"displaylogo": False}),
+                ]
+            ),
+            className="shadow-sm",
+        )
+        return dbc.Row(
+            [dbc.Col(summary_card, md=4), dbc.Col(scf_card, md=8)],
+            className="g-3 mt-3",
+        )
+
+    return dbc.Row(
+        [dbc.Col(summary_card, md=12)],
+        className="g-3 mt-3",
+    )
+
+
+def _build_scf_figure(iters: list[tuple[int, float]]):
+    """Two traces: relative energy in kcal/mol (left), |ΔE_step| log (right)."""
+    idx = [i for i, _ in iters]
+    energies = [e for _, e in iters]
+    e0 = energies[0]
+    rel_kcal = [(e - e0) * 627.5092 for e in energies]
+    dE = [None] + [abs(energies[k] - energies[k - 1])
+                   for k in range(1, len(energies))]
+
+    return {
+        "data": [
+            {"x": idx, "y": rel_kcal,
+             "type": "scatter", "mode": "lines+markers",
+             "name": "ΔE vs iter 1 (kcal/mol)",
+             "line": {"color": "#58a6ff", "width": 2},
+             "marker": {"size": 6},
+             "hovertemplate": "iter %{x}<br>ΔE = %{y:.4f} kcal/mol<extra></extra>"},
+            {"x": idx, "y": dE,
+             "type": "scatter", "mode": "lines+markers",
+             "name": "|ΔE step| (Ha)",
+             "yaxis": "y2",
+             "line": {"color": "#ff7b72", "width": 1, "dash": "dot"},
+             "marker": {"size": 5},
+             "hovertemplate": "iter %{x}<br>|ΔE| = %{y:.2e} Ha<extra></extra>"},
+        ],
+        "layout": {
+            "template": "plotly_dark",
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor":  "rgba(0,0,0,0)",
+            "xaxis": {"title": "SCF iteration",
+                      "dtick": 1 if len(idx) <= 20 else None,
+                      "gridcolor": "#30363d"},
+            "yaxis": {"title": "ΔE (kcal/mol)", "gridcolor": "#30363d"},
+            "yaxis2": {"title": "|ΔE step| (Ha)", "overlaying": "y",
+                       "side": "right", "showgrid": False, "type": "log"},
+            "legend": {"orientation": "h", "y": -0.25},
+            "margin": {"l": 60, "r": 60, "t": 20, "b": 60},
+            "height": 340,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

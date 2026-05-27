@@ -232,3 +232,43 @@ def test_aoforce_empty_input():
     assert s.frequencies_cm1 == []
     assert s.n_modes is None
     assert s.zpe_ha is None
+
+# ===========================================================================
+# SCF iteration parser
+# ===========================================================================
+
+from backend.result_parser import parse_scf_iterations
+
+
+_RIDFT_SCF_REAL = """\
+ ITERATION  ENERGY          1e-ENERGY        2e-ENERGY     NORM[dD(SAO)]  TOL
+   1  -7401.0407959107    -40945.416506     18159.243113    0.000D+00 0.296D-10
+                            Exc = -646.732677337     Coul =  18805.9757903
+                              N = 553.99861121
+                            current damping = 0.700
+ ITERATION  ENERGY          1e-ENERGY        2e-ENERGY     NORM[dD(SAO)]  TOL
+   2  -7401.0407958943    -40945.412193     18159.238801    0.259D-03 0.188D-10
+                            Exc = -646.732627042
+ ENERGY CONVERGED !
+ ITERATION  ENERGY          1e-ENERGY        2e-ENERGY     NORM[dD(SAO)]  TOL
+   3  -7401.0398854867    -40945.414105     18159.241623    0.331D-04 0.176D-10
+"""
+
+
+def test_parse_scf_iterations_real_format():
+    iters = parse_scf_iterations(_RIDFT_SCF_REAL)
+    assert len(iters) == 3
+    assert iters[0] == (1, -7401.0407959107)
+    assert iters[1][0] == 2
+    assert iters[2][0] == 3
+
+
+def test_parse_scf_iterations_empty_when_no_block():
+    assert parse_scf_iterations("nothing here") == []
+
+
+def test_parse_scf_iterations_from_path(tmp_path):
+    p = tmp_path / "ridft.out"
+    p.write_text(_RIDFT_SCF_REAL)
+    iters = parse_scf_iterations(p)
+    assert len(iters) == 3

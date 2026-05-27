@@ -150,9 +150,10 @@ def _setup_job_dir(tmp_path: Path) -> Path:
 def test_load_trajectory_merges_energy_and_gradient(tmp_path):
     traj = load_trajectory(_setup_job_dir(tmp_path))
     assert traj.n_cycles == 2
-    # SCFKIN comes from `energy` and must have been merged in
+    # SCFKIN from `energy` is merged in by matching cycle number;
+    # `_GRADIENT_FILE` has cycles 1 and 2, so we read rows 1 and 2 of energy.
     assert traj.cycles[0].scf_kinetic == pytest.approx(76.0)
-    assert traj.cycles[1].scf_kinetic == pytest.approx(76.2)
+    assert traj.cycles[1].scf_kinetic == pytest.approx(76.1)
 
 
 def test_load_trajectory_thresholds_from_control(tmp_path):
@@ -178,12 +179,13 @@ def test_xyz_rendering(tmp_path):
 
 
 def test_convergence_evaluation(tmp_path):
-    """With energy=7 and gcart=4 in $jobex, the last cycle (|ΔE|≈2.5e-3,
-    |grad|max=1e-4) should fail the energy criterion but pass gradient."""
+    """With energy=7 and gcart=4 in $jobex, the last cycle (|ΔE|≈3.5e-3,
+    |grad|max=1e-4) should fail the energy criterion. The gradient_max
+    threshold is 1e-4 too, so |1e-4 < 1e-4| is False → not converged."""
     traj = load_trajectory(_setup_job_dir(tmp_path))
     st = traj.convergence_status()
-    assert st["gradient_max"]["ok"] is True
     assert st["energy_change"]["ok"] is False
+    assert st["gradient_max"]["ok"] is False
     assert traj.converged() is False
 
 
@@ -212,9 +214,14 @@ def test_trajectory_xyz_multiframe(tmp_path):
     # 2 cycles * (1 header + 1 comment + 3 atoms) = 10 lines
     assert len(frames) == 10
     assert frames[0] == "3"
+    # Cycle 2 layout (0-indexed):
+    #   frames[5] = header "3"
+    #   frames[6] = comment
+    #   frames[7] = O at (0,0,0)
+    #   frames[8] = H at (1.81,0,0) Bohr
+    #   frames[9] = H at (0,1.81,0) Bohr
     assert frames[5] == "3"
-    # Cycle 2's second atom = H at 1.81 Bohr -> 0.958 Å
-    parts = frames[7].split()
+    parts = frames[8].split()
     assert parts[0] == "H"
     assert abs(float(parts[1]) - 1.81 * BOHR_TO_ANGSTROM) < 1e-6
 
