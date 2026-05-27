@@ -52,6 +52,8 @@ class AppConfig:
     download_dir: Path = Path.home() / ".turbomole_orchestrator" / "downloads"
     # Reusable JSON submission protocols saved from the New job tab.
     protocols_dir: Path = Path.home() / ".turbomole_orchestrator" / "protocols"
+    # App-wide settings (external tool paths, etc.).
+    settings_dir: Path = Path.home() / ".turbomole_orchestrator"
     poll_interval_s: int = 30
     clusters: dict[str, RemoteCluster] = field(default_factory=dict)
 

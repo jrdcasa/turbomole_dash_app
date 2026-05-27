@@ -34,10 +34,11 @@ def build_layout(cfg: AppConfig) -> html.Div:
                     _save_protocol_modal(),
                     dbc.Tabs(
                         [
-                            dbc.Tab(_tab_new_job(cfg),  label="New job",     tab_id="tab-new"),
-                            dbc.Tab(_tab_jobs(),        label="Job manager", tab_id="tab-jobs"),
-                            dbc.Tab(_tab_clusters(cfg), label="Clusters",    tab_id="tab-clusters"),
-                            dbc.Tab(_tab_database(),    label="Database",    tab_id="tab-db"),
+                            dbc.Tab(_tab_new_job(cfg), label="New job", tab_id="tab-new"),
+                            dbc.Tab(_tab_jobs(), label="Job manager", tab_id="tab-jobs"),
+                            dbc.Tab(_tab_analysis(), label="Analysis", tab_id="tab-analysis"),
+                            dbc.Tab(_tab_clusters(cfg), label="Clusters", tab_id="tab-clusters"),
+                            dbc.Tab(_tab_database(), label="Database", tab_id="tab-db"),
                         ],
                         id="main-tabs",
                         active_tab="tab-new",
@@ -662,4 +663,108 @@ def _tab_database() -> html.Div:
             html.Div(id="db-status-line", className="small text-muted mb-2"),
             html.Div(id="db-table-container"),
         ]
+    )
+
+# ---------------------------------------------------------------------------
+# Tab 5 — Analysis
+# ---------------------------------------------------------------------------
+def _tab_analysis() -> html.Div:
+    """Post-processing of downloaded jobs. Renders different content per
+    task type (optimization / single_point / frequencies / aimd) and
+    exposes paths + launchers for VMD / COSMOBuild / COSMOQuick."""
+    return html.Div(
+        [
+            dbc.Alert(
+                [
+                    html.I(className="bi bi-info-circle me-2"),
+                    "Analysis works on ",
+                    html.B("locally downloaded"),
+                    " jobs. Use ",
+                    html.B("Download"),
+                    " or ",
+                    html.B("Partial"),
+                    " from the Job manager to pull files first.",
+                ],
+                color="info",
+                className="mt-3 py-2 small",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            dbc.Label("Job",
+                                      className="small text-muted mb-1"),
+                            dcc.Dropdown(
+                                id="analysis-job-dropdown",
+                                placeholder="-- select a downloaded job --",
+                                clearable=True,
+                            ),
+                        ],
+                        md=6,
+                    ),
+                    dbc.Col(_card_external_tools(), md=6),
+                ],
+                className="g-3 mb-3",
+            ),
+            html.Div(id="analysis-content"),
+        ]
+    )
+
+
+def _card_external_tools() -> dbc.Card:
+    """Three inputs + three launch buttons for VMD / COSMOBuild / COSMOQuick.
+
+    Paths are persisted to ~/.turbomole_orchestrator/app_settings.json
+    on blur. Launchers operate on the currently selected job's local
+    download directory."""
+    rows = []
+    for key, label, default_cmd in (
+        ("vmd",        "VMD",        "vmd"),
+        ("cosmobuild", "COSMOBuild", "cosmobuild"),
+        ("cosmoquick", "COSMOQuick", "cosmoquick"),
+    ):
+        rows.append(
+            dbc.Row(
+                [
+                    dbc.Col(dbc.Label(label, className="small mb-0"),
+                            md=3, className="d-flex align-items-center"),
+                    dbc.Col(
+                        dbc.Input(
+                            id=f"inp-tool-{key}",
+                            placeholder=f"absolute path or '{default_cmd}'",
+                            type="text", size="sm",
+                        ),
+                        md=6,
+                    ),
+                    dbc.Col(
+                        dbc.Button(
+                            [html.I(className="bi bi-play-fill me-1"),
+                             "Launch"],
+                            id=f"btn-launch-{key}",
+                            color="primary", outline=True, size="sm",
+                            className="w-100",
+                        ),
+                        md=3,
+                    ),
+                ],
+                className="g-2 mb-2 align-items-center",
+            )
+        )
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.H6(
+                    [html.I(className="bi bi-tools me-2"),
+                     "External tools"],
+                    className="card-subtitle text-muted mb-2",
+                ),
+                html.Div(rows),
+                html.Small(
+                    "Leave empty to look up the command on PATH. Paths "
+                    "save automatically when you leave the field.",
+                    className="text-muted",
+                ),
+            ]
+        ),
+        className="shadow-sm h-100",
     )

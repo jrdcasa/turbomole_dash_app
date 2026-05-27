@@ -37,6 +37,7 @@ from backend.turbomole_io import (
 )
 from remote import slurm_remote, ssh_client
 from workers.poller import refresh_active_jobs, refresh_single_job
+from app_ui.analysis_callbacks import register_analysis_callbacks
 
 
 log = logging.getLogger("callbacks")
@@ -50,7 +51,7 @@ def register_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
     _register_job_detail_callbacks(app, cfg)
     _register_cluster_test_callback(app, cfg)
     _register_db_inspector_callbacks(app, cfg)
-
+    register_analysis_callbacks(app, cfg)
 
 # ===========================================================================
 # Tab 1 — New job  (unchanged)
