@@ -714,7 +714,7 @@ def _tab_analysis() -> html.Div:
 def _card_external_tools() -> dbc.Card:
     """Three inputs + three launch buttons for VMD / COSMOBuild / COSMOQuick.
 
-    Paths are persisted to ~/.turbomole_orchestrator/app_settings.json
+    Paths are persisted to ~/turbomole_orchestrator/app_settings.json
     on blur. Launchers operate on the currently selected job's local
     download directory."""
     rows = []

@@ -2,7 +2,7 @@
 Configuration loader. Reads config.yaml from:
   1. The project root (next to app.py) — recommended
   2. The current working directory
-  3. ~/.turbomole_orchestrator/config.yaml
+  3. ~/turbomole_orchestrator/config.yaml
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATHS = [
     _PROJECT_ROOT / "config.yaml",                          # 1. next to app.py
     Path.cwd() / "config.yaml",                              # 2. cwd
-    Path.home() / ".turbomole_orchestrator" / "config.yaml", # 3. user-global
+    Path.home() / "turbomole_orchestrator" / "config.yaml", # 3. user-global
 ]
 
 
@@ -63,6 +63,8 @@ def _ensure_dirs(cfg: AppConfig) -> None:
     cfg.local_workdir.mkdir(parents=True, exist_ok=True)
     cfg.download_dir.mkdir(parents=True, exist_ok=True)
     cfg.protocols_dir.mkdir(parents=True, exist_ok=True)
+    cfg.settings_dir.mkdir(parents=True, exist_ok=True)
+
 
 
 def load_config(path: str | os.PathLike | None = None) -> AppConfig:

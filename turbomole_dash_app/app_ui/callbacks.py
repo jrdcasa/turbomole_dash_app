@@ -1408,7 +1408,7 @@ def _register_db_inspector_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 # ===========================================================================
 #
 # A "protocol" is the New job form state minus the molecular structure,
-# persisted to ~/.turbomole_orchestrator/protocols/<name>.json so users can
+# persisted to ~/turbomole_orchestrator/protocols/<name>.json so users can
 # reuse calculation setups across molecules.
 #
 # These callbacks orchestrate four user actions:

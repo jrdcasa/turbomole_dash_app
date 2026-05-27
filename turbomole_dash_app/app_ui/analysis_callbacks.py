@@ -1,20 +1,21 @@
 """
 Callbacks for the Analysis tab.
 
-Operates exclusively on locally-downloaded job directories. For each job
-that has been downloaded (DOWNLOADED state, or any state with at least
-one partial/full snapshot in cfg.download_dir), the user can:
+When a downloaded job is selected, the app materializes analysis artifacts
+(xyz, csv, gnuplot scripts) inside `<job_local_dir>/analysis/` and displays:
 
-  - optimization:  energy vs cycle chart, convergence criteria table,
-                   last geometry as .xyz, full trajectory as multi-frame
-                   .xyz, CSV export, gnuplot scripts
-  - single_point:  parsed ridft.out summary, CSV export
-  - frequencies:   IR stick plot, imaginary modes highlighted, CSV +
-                   gnuplot script
+  - opt:    energy chart + convergence table
+  - sp:     parsed ridft.out summary
+  - freq:   IR stick plot + thermochemistry
+  - aimd:   informational only
 
-In addition the tab exposes paths and launch buttons for three external
+A "Generated files" panel always shows the absolute path of each
+artifact with a one-click copy-to-clipboard icon. No download buttons,
+no dcc.Download.
+
+The tab also exposes paths and launch buttons for three external
 desktop tools (VMD, COSMOBuild, COSMOQuick). Paths persist in
-~/.turbomole_orchestrator/app_settings.json.
+~/turbomole_orchestrator/app_settings.json.
 """
 
 from __future__ import annotations
@@ -32,24 +33,16 @@ from dash import Input, Output, State, ctx, dcc, html, no_update
 import dash_bootstrap_components as dbc
 
 from backend import app_settings
+from backend.analysis_writer import ArtifactSet, write_artifacts
 from backend.config import AppConfig
 from backend.db import list_jobs
-from backend.opt_trajectory import (
-    BOHR_TO_ANGSTROM, OptTrajectory, load_trajectory, trajectory_xyz,
-)
+from backend.opt_trajectory import OptTrajectory, load_trajectory
 from backend.result_parser import parse_aoforce, parse_ridft
-from backend.analysis_exports import (
-    JobMeta,
-    gnuplot_optimization, gnuplot_spectrum, gnuplot_trajectory,
-    single_point_to_csv, spectrum_to_csv, trajectory_to_csv,
-)
 
 
 log = logging.getLogger("analysis")
 
 
-# Tools that can be launched. Display name, settings field, default
-# executable to look up on PATH if no absolute path is configured.
 _TOOLS = [
     ("vmd",        "VMD",        "vmd"),
     ("cosmobuild", "COSMOBuild", "cosmobuild"),
@@ -63,7 +56,6 @@ _TOOLS = [
 
 def register_analysis_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 
-    # --- Job selector ------------------------------------------------------
     @app.callback(
         Output("analysis-job-dropdown", "options"),
         Input("main-tabs", "active_tab"),
@@ -78,7 +70,6 @@ def register_analysis_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             for j in items
         ]
 
-    # --- Main content ------------------------------------------------------
     @app.callback(
         Output("analysis-content", "children"),
         Input("analysis-job-dropdown", "value"),
@@ -99,110 +90,30 @@ def register_analysis_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                 color="warning",
             )
 
+        # Materialize artifacts on disk; this is fast (regex parsers +
+        # a handful of text writes) so we run it synchronously.
+        try:
+            artifacts = write_artifacts(job, local_dir)
+        except Exception as exc:                            # noqa: BLE001
+            log.exception("write_artifacts failed for job %s", job_id)
+            return dbc.Alert(f"Could not generate artifacts: {exc}",
+                             color="danger")
+
         task = job["task_type"]
         if task == "optimization":
-            return _render_optimization(job, local_dir)
-        if task == "single_point":
-            return _render_single_point(job, local_dir)
-        if task == "frequencies":
-            return _render_frequencies(job, local_dir)
-        if task == "aimd":
-            return _render_aimd(job, local_dir)
-        return dbc.Alert(
-            f"Analysis view for task type '{task}' is not implemented yet.",
-            color="secondary",
-        )
-
-    # --- Downloads (CSV / xyz / gnuplot) -----------------------------------
-    @app.callback(
-        Output("analysis-file-download", "data"),
-        Input("btn-dl-last-xyz",       "n_clicks"),
-        Input("btn-dl-traj-xyz",       "n_clicks"),
-        Input("btn-dl-csv",            "n_clicks"),
-        Input("btn-dl-gnuplot-energy", "n_clicks"),
-        Input("btn-dl-gnuplot-grad",   "n_clicks"),
-        Input("btn-dl-gnuplot-spec",   "n_clicks"),
-        State("analysis-job-dropdown", "value"),
-        prevent_initial_call=True,
-    )
-    def _serve_download(_n1, _n2, _n3, _n4, _n5, _n6, job_id):
-        trig = ctx.triggered_id
-        if trig is None or not job_id:
-            return no_update
-        job = next((j for j in list_jobs() if j["id"] == job_id), None)
-        if job is None:
-            return no_update
-        local_dir = _resolve_local_dir(cfg, job)
-        if local_dir is None:
-            return no_update
-
-        meta = JobMeta(name=job["name"],
-                       functional=job.get("functional"),
-                       basis_set=job.get("basis_set"))
-
-        if trig == "btn-dl-last-xyz":
-            traj = load_trajectory(local_dir)
-            xyz = traj.to_xyz(
-                comment=(f"{job['name']} cycle={traj.n_cycles} "
-                         f"E={traj.cycles[-1].scf_energy:.10f} Ha")
-                if traj.cycles else job["name"]
+            view = _view_optimization(job, local_dir)
+        elif task == "single_point":
+            view = _view_single_point(job, local_dir)
+        elif task == "frequencies":
+            view = _view_frequencies(job, local_dir)
+        elif task == "aimd":
+            view = _view_aimd(job, local_dir)
+        else:
+            view = dbc.Alert(
+                f"Analysis view for task type '{task}' is not implemented yet.",
+                color="secondary",
             )
-            if not xyz:
-                return no_update
-            return dict(
-                content=xyz,
-                filename=f"{job['name']}_cycle{traj.n_cycles}_last.xyz",
-            )
-
-        if trig == "btn-dl-traj-xyz":
-            xyz = trajectory_xyz(local_dir, name=job["name"])
-            if not xyz:
-                return no_update
-            return dict(
-                content=xyz,
-                filename=f"{job['name']}_trajectory.xyz",
-            )
-
-        if trig == "btn-dl-csv":
-            return _csv_for_job(job, local_dir)
-
-        if trig == "btn-dl-gnuplot-energy":
-            traj = load_trajectory(local_dir)
-            if traj.n_cycles == 0:
-                return no_update
-            return dict(
-                content=gnuplot_optimization(
-                    csv_filename=f"{job['name']}_trajectory.csv",
-                    meta=meta,
-                ),
-                filename=f"{job['name']}_energy.gp",
-            )
-
-        if trig == "btn-dl-gnuplot-grad":
-            traj = load_trajectory(local_dir)
-            if traj.n_cycles == 0:
-                return no_update
-            return dict(
-                content=gnuplot_trajectory(
-                    csv_filename=f"{job['name']}_trajectory.csv",
-                    meta=meta,
-                ),
-                filename=f"{job['name']}_gradient.gp",
-            )
-
-        if trig == "btn-dl-gnuplot-spec":
-            aoforce = local_dir / "aoforce.out"
-            if not aoforce.exists():
-                return no_update
-            return dict(
-                content=gnuplot_spectrum(
-                    csv_filename=f"{job['name']}_spectrum.csv",
-                    meta=meta,
-                ),
-                filename=f"{job['name']}_spectrum.gp",
-            )
-
-        return no_update
+        return html.Div([view, _files_panel(artifacts)])
 
     # --- External tools: load saved paths into the inputs ------------------
     @app.callback(
@@ -218,7 +129,7 @@ def register_analysis_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         et = s.external_tools
         return et.vmd, et.cosmobuild, et.cosmoquick
 
-    # --- External tools: persist paths on blur (each input independently) --
+    # --- External tools: persist paths on blur -----------------------------
     @app.callback(
         Output("last-action", "data", allow_duplicate=True),
         Input("inp-tool-vmd",        "n_blur"),
@@ -267,13 +178,18 @@ def register_analysis_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             return {"ok": False, "ts": time.time(),
                     "msg": "Job has no local files. Download it first."}
 
+        if os.path.exists(str(local_dir)+"/gradient"):
+            cosmoquick_file = str(local_dir)+"/gradient"
+        else:
+            cosmoquick_file = str(local_dir) + "/coord"
+
         mapping = {
             "btn-launch-vmd":        ("vmd",        vmd_path,
                                       _vmd_args(local_dir)),
             "btn-launch-cosmobuild": ("cosmobuild", cb_path,
-                                      [str(local_dir)]),
+                                      [str(local_dir)+"/coord"]),
             "btn-launch-cosmoquick": ("cosmoquick", cq_path,
-                                      [str(local_dir)]),
+                                      [cosmoquick_file]),
         }
         if trig not in mapping:
             return no_update
@@ -286,11 +202,7 @@ def register_analysis_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 # ---------------------------------------------------------------------------
 
 def _downloadable_jobs(cfg: AppConfig) -> list[dict]:
-    out: list[dict] = []
-    for j in list_jobs():
-        if _resolve_local_dir(cfg, j) is not None:
-            out.append(j)
-    return out
+    return [j for j in list_jobs() if _resolve_local_dir(cfg, j) is not None]
 
 
 def _resolve_local_dir(cfg: AppConfig, job: dict) -> Path | None:
@@ -306,19 +218,16 @@ def _resolve_local_dir(cfg: AppConfig, job: dict) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Renderers
+# Per-task views (no buttons inside — artifact paths live in the files panel)
 # ---------------------------------------------------------------------------
 
-def _render_optimization(job: dict, local_dir: Path) -> html.Div:
+def _view_optimization(job: dict, local_dir: Path) -> html.Div:
     traj = load_trajectory(local_dir)
     if traj.n_cycles == 0:
         return dbc.Alert(
-            "No `energy` / `gradient` data found in the downloaded "
-            "directory. The optimization may not have produced any cycle "
-            "yet, or the files were excluded.", color="warning",
+            "No `energy` / `gradient` data found in the downloaded directory.",
+            color="warning",
         )
-
-    has_traj_xyz = (local_dir / "gradient").exists()
 
     energy_card = dbc.Card(
         dbc.CardBody(
@@ -355,50 +264,13 @@ def _render_optimization(job: dict, local_dir: Path) -> html.Div:
         className="shadow-sm",
     )
 
-    geom_card = dbc.Card(
-        dbc.CardBody(
-            [
-                html.H5([html.I(className="bi bi-box me-2"),
-                         "Geometry / data exports"], className="card-title"),
-                html.Div(
-                    [
-                        _dl_btn("btn-dl-last-xyz", "bi-download",
-                                "Last geometry (.xyz)",
-                                "Single-frame xyz of the last cycle"),
-                        _dl_btn("btn-dl-traj-xyz", "bi-collection-play",
-                                "Trajectory (.xyz)",
-                                "Multi-frame xyz with every cycle",
-                                disabled=not has_traj_xyz),
-                        _dl_btn("btn-dl-csv", "bi-filetype-csv",
-                                "Trajectory (.csv)",
-                                "cycle, energy, ΔE, |grad|, |grad|max"),
-                        _dl_btn("btn-dl-gnuplot-energy", "bi-graph-up-arrow",
-                                "Gnuplot: energy",
-                                "Script to plot ΔE vs cycle (kcal/mol)"),
-                        _dl_btn("btn-dl-gnuplot-grad", "bi-bar-chart-steps",
-                                "Gnuplot: gradient",
-                                "Script to plot |grad| vs cycle (log y)"),
-                    ],
-                    className="d-flex flex-wrap gap-2 mb-2",
-                ),
-            ]
-        ),
-        className="shadow-sm",
-    )
-
-    return html.Div(
-        [
-            dbc.Row(
-                [dbc.Col(energy_card, md=8),
-                 dbc.Col(conv_card, md=4)],
-                className="g-3 mt-1",
-            ),
-            dbc.Row(dbc.Col(geom_card), className="g-3"),
-        ]
+    return dbc.Row(
+        [dbc.Col(energy_card, md=8), dbc.Col(conv_card, md=4)],
+        className="g-3 mt-1",
     )
 
 
-def _render_single_point(job: dict, local_dir: Path) -> html.Div:
+def _view_single_point(job: dict, local_dir: Path) -> html.Div:
     ridft = local_dir / "ridft.out"
     if not ridft.exists():
         return dbc.Alert("No ridft.out in the downloaded directory.",
@@ -413,19 +285,13 @@ def _render_single_point(job: dict, local_dir: Path) -> html.Div:
                 html.H5([html.I(className="bi bi-lightning-charge me-2"),
                          "Single-point results"], className="card-title"),
                 html.Div(items),
-                html.Hr(),
-                html.Div(
-                    _dl_btn("btn-dl-csv", "bi-filetype-csv",
-                            "Summary (.csv)",
-                            "Parsed key/value table"),
-                ),
             ]
         ),
         className="shadow-sm",
     )
 
 
-def _render_frequencies(job: dict, local_dir: Path) -> html.Div:
+def _view_frequencies(job: dict, local_dir: Path) -> html.Div:
     aoforce = local_dir / "aoforce.out"
     if not aoforce.exists():
         return dbc.Alert("No aoforce.out in the downloaded directory.",
@@ -437,24 +303,11 @@ def _render_frequencies(job: dict, local_dir: Path) -> html.Div:
 
     items = [_kv(k, v) for k, v in summary.as_display_dict().items()]
     n_imag = summary.n_imaginary or 0
-
     alert = (dbc.Alert(
         [html.I(className="bi bi-exclamation-triangle me-2"),
          f"{n_imag} imaginary mode(s) detected — structure is NOT a minimum."],
         color="warning", className="py-2 small",
     ) if n_imag > 0 else html.Div())
-
-    exports = html.Div(
-        [
-            _dl_btn("btn-dl-csv", "bi-filetype-csv",
-                    "Spectrum (.csv)",
-                    "mode, frequency, kind"),
-            _dl_btn("btn-dl-gnuplot-spec", "bi-graph-up-arrow",
-                    "Gnuplot: spectrum",
-                    "Script to plot the stick spectrum"),
-        ],
-        className="d-flex flex-wrap gap-2 mt-2",
-    )
 
     return html.Div(
         [
@@ -485,8 +338,6 @@ def _render_frequencies(job: dict, local_dir: Path) -> html.Div:
                                     html.H5("Thermochemistry",
                                             className="card-title"),
                                     html.Div(items),
-                                    html.Hr(),
-                                    exports,
                                 ]
                             ),
                             className="shadow-sm",
@@ -500,32 +351,99 @@ def _render_frequencies(job: dict, local_dir: Path) -> html.Div:
     )
 
 
-def _render_aimd(job: dict, local_dir: Path) -> html.Div:
-    """AIMD reuses the trajectory export from gradient when frog leaves
-    geometry snapshots there. If not, only the .xyz download is offered."""
-    has_traj = (local_dir / "gradient").exists()
+def _view_aimd(job: dict, local_dir: Path) -> html.Div:
     return dbc.Card(
         dbc.CardBody(
             [
                 html.H5([html.I(className="bi bi-broadcast-pin me-2"),
                          "AIMD trajectory"], className="card-title"),
-                html.P("Download the recorded trajectory for visualization.",
-                       className="text-muted small"),
-                html.Div(
-                    [
-                        _dl_btn("btn-dl-traj-xyz", "bi-collection-play",
-                                "Trajectory (.xyz)",
-                                "Multi-frame xyz", disabled=not has_traj),
-                        _dl_btn("btn-dl-last-xyz", "bi-download",
-                                "Last frame (.xyz)",
-                                "Single-frame xyz of the last step",
-                                disabled=not has_traj),
-                    ],
-                    className="d-flex flex-wrap gap-2",
-                ),
+                html.P("Generated artifacts are listed below; open them "
+                       "in VMD or paste a path elsewhere.",
+                       className="text-muted small mb-0"),
             ]
         ),
         className="shadow-sm",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Files panel (paths + copy-to-clipboard)
+# ---------------------------------------------------------------------------
+
+def _files_panel(artifacts: ArtifactSet) -> dbc.Card:
+    """Render the list of files generated by write_artifacts."""
+    body: list = []
+
+    if artifacts.files:
+        # Output dir first so the user can open the folder directly.
+        body.append(_path_row("Output directory",
+                              str(artifacts.out_dir),
+                              badge_color="info"))
+        for f in artifacts.files:
+            body.append(_path_row(f.name, str(f)))
+    else:
+        body.append(html.Div("No artifacts were generated for this job.",
+                             className="text-muted small"))
+
+    if artifacts.warnings:
+        body.append(html.Hr())
+        body.append(html.Div(
+            [html.I(className="bi bi-info-circle me-1"),
+             html.Span(" • ".join(artifacts.warnings))],
+            className="small text-warning",
+        ))
+
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.H5(
+                    [html.I(className="bi bi-folder2-open me-2"),
+                     "Generated files"],
+                    className="card-title",
+                ),
+                html.P(
+                    "Files are written inside the job directory. Click the "
+                    "clipboard icon to copy a full path.",
+                    className="text-muted small mb-2",
+                ),
+                html.Div(body),
+            ]
+        ),
+        className="shadow-sm mt-3",
+    )
+
+
+def _path_row(label: str, path: str, badge_color: str | None = None) -> html.Div:
+    """Label + code-styled path + clipboard icon.
+
+    `dcc.Clipboard` with `content=<path>` copies the literal string when
+    clicked. This is the same pattern used by `_path_with_copy` in the
+    Job manager.
+    """
+    label_node = (
+        dbc.Badge(label, color=badge_color, className="me-2")
+        if badge_color
+        else html.Span(label, className="me-2 small text-muted",
+                       style={"minWidth": "11rem",
+                              "display": "inline-block"})
+    )
+    return html.Div(
+        [
+            label_node,
+            html.Code(
+                path,
+                title=path,
+                className="small me-2",
+                style={"userSelect": "all", "wordBreak": "break-all"},
+            ),
+            dcc.Clipboard(
+                content=path,
+                title="Copy full path to clipboard",
+                style={"display": "inline-block", "cursor": "pointer",
+                       "verticalAlign": "middle", "fontSize": "0.95rem"},
+            ),
+        ],
+        className="d-flex align-items-center mb-1",
     )
 
 
@@ -609,33 +527,6 @@ def _build_spectrum_figure(summary):
 
 
 # ---------------------------------------------------------------------------
-# CSV dispatcher
-# ---------------------------------------------------------------------------
-
-def _csv_for_job(job: dict, local_dir: Path):
-    task = job["task_type"]
-    if task == "optimization":
-        traj = load_trajectory(local_dir)
-        if traj.n_cycles == 0:
-            return no_update
-        return dict(content=trajectory_to_csv(traj),
-                    filename=f"{job['name']}_trajectory.csv")
-    if task == "single_point":
-        ridft = local_dir / "ridft.out"
-        if not ridft.exists():
-            return no_update
-        return dict(content=single_point_to_csv(parse_ridft(ridft)),
-                    filename=f"{job['name']}_singlepoint.csv")
-    if task == "frequencies":
-        aoforce = local_dir / "aoforce.out"
-        if not aoforce.exists():
-            return no_update
-        return dict(content=spectrum_to_csv(parse_aoforce(aoforce)),
-                    filename=f"{job['name']}_spectrum.csv")
-    return no_update
-
-
-# ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
 
@@ -674,19 +565,6 @@ def _build_convergence_table(traj: OptTrajectory) -> dbc.Table:
                      className="mb-0 small")
 
 
-def _dl_btn(btn_id: str, icon: str, label: str, tooltip: str,
-            disabled: bool = False):
-    btn = dbc.Button(
-        [html.I(className=f"bi {icon} me-1"), label],
-        id=btn_id, color="primary", outline=True, size="sm",
-        disabled=disabled,
-    )
-    return html.Span(
-        [btn, dbc.Tooltip(tooltip, target=btn_id, placement="top",
-                          delay={"show": 400, "hide": 100})]
-    )
-
-
 def _placeholder(msg: str) -> html.Div:
     return dbc.Alert(msg, color="secondary", className="mt-3")
 
@@ -703,36 +581,24 @@ def _kv(key, value) -> html.Div:
 # ---------------------------------------------------------------------------
 
 def _vmd_args(local_dir: Path) -> list[str]:
-    """Prefer the trajectory .xyz if Turbomole produced one, otherwise
-    fall back to the static `coord` file. VMD reads both."""
-    traj = local_dir / "gradient"
+    """Pass the multi-frame trajectory .xyz if it was generated, else
+    fall back to the last-frame .xyz, else to the static `coord` file."""
+    analysis = local_dir / "analysis"
+    if analysis.exists():
+        for pattern in ("*_trajectory.xyz", "*_last.xyz"):
+            for p in sorted(analysis.glob(pattern)):
+                return [str(p)]
     coord = local_dir / "coord"
-    if traj.exists():
-        # VMD doesn't read Turbomole's `gradient` directly; convert on
-        # the fly to a temp .xyz next to the data so VMD can open it.
-        xyz_path = local_dir / "trajectory.xyz"
-        try:
-            xyz_text = trajectory_xyz(local_dir, name=local_dir.name)
-            if xyz_text:
-                xyz_path.write_text(xyz_text)
-                return [str(xyz_path)]
-        except OSError:
-            pass
     if coord.exists():
         return [str(coord)]
     return [str(local_dir)]
 
 
 def _resolve_binary(configured: str, default_name: str) -> str | None:
-    """Return a usable command for subprocess. Configured absolute path
-    wins; otherwise look up `default_name` on PATH. Returns None if
-    neither resolves."""
     if configured:
         p = Path(os.path.expanduser(configured))
         if p.exists() and os.access(p, os.X_OK):
             return str(p)
-        # Allow a bare command name even if not directly on disk (some
-        # binaries are wrappers on PATH but in non-standard locations).
         which = shutil.which(configured)
         if which:
             return which
@@ -763,5 +629,4 @@ def _launch_subprocess(key: str, configured_path: str | None,
         log.exception("Launch of %s failed", display)
         return {"ok": False, "ts": time.time(),
                 "msg": f"Could not launch {display}: {exc}"}
-    return {"ok": True, "ts": time.time(),
-            "msg": f"Launched {display}."}
+    return {"ok": True, "ts": time.time(), "msg": f"Launched {display}."}

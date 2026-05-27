@@ -1,9 +1,11 @@
 # Copy to ./config.yaml (next to app.py) or ~/.turbomole_orchestrator/config.yaml
 # Credentials are NOT stored here — use ssh-agent or key files.
 
-db_path: ~/.turbomole_orchestrator/jobs.sqlite
-local_workdir: ~/.turbomole_orchestrator/workspace
-download_dir: ~/.turbomole_orchestrator/downloads
+db_path: ~/turbomole_orchestrator/jobs.sqlite
+local_workdir: ~/turbomole_orchestrator/workspace
+download_dir: ~/turbomole_orchestrator/downloads
+protocols_dir: ~/turbomole_orchestrator/protocols
+settings_dir: ~/turbomole_orchestrator/settings
 poll_interval_s: 30
 
 clusters:

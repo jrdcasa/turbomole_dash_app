@@ -271,8 +271,10 @@ class DefineDriver_7_8(DefineDriver):
         # --- SCF ---
         lines += [
             "scf",
-            f"conv {spec.scf_conv}",
-            f"iter {spec.scf_iter}",
+            "conv",
+            f"{spec.scf_conv}",
+            "iter",
+            f"{spec.scf_iter}",
             "",                          # back to main
         ]
 

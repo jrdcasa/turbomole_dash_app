@@ -49,6 +49,15 @@ _RE_CPU_TIME = re.compile(
     re.IGNORECASE,
 )
 
+# WALL time line. Different binaries phrase it differently:
+#   total wall-time :   1 second
+#   total wall-time   :   00:00:02
+#   total wall-time    =  1.23 seconds
+_RE_WALL_TIME = re.compile(
+    r"total\s+wall[- ]time\s*[:=]\s*([0-9:.]+)\s*(seconds?|s|min|hour)?",
+    re.IGNORECASE,
+)
+
 # HOMO-LUMO gap: in ridft output we get the orbital energies block:
 #   number of occupied orbitals ...
 #   orbital energies:
@@ -86,6 +95,8 @@ class RidftSummary:
     converged: bool | None = None
     cpu_time_s: float | None = None
     cpu_time_str: str | None = None        # raw string, in case it was "00:01:23"
+    wall_time_s: float | None = None
+    wall_time_str: str | None = None       # raw string, in case it was "00:01:23"
     homo_lumo_ha: float | None = None
     homo_lumo_ev: float | None = None
     dipole_au: float | None = None
@@ -103,6 +114,8 @@ class RidftSummary:
             d["Converged"] = "yes" if self.converged else "no"
         if self.cpu_time_str:
             d["CPU time"] = self.cpu_time_str
+        if self.wall_time_str:
+            d["Wall time"] = self.wall_time_str
         if self.homo_lumo_ha is not None:
             ev = f" ({self.homo_lumo_ev:.3f} eV)" if self.homo_lumo_ev is not None else ""
             d["HOMO-LUMO gap"] = f"{self.homo_lumo_ha:.5f} Ha{ev}"
@@ -115,7 +128,6 @@ class RidftSummary:
 # ---------------------------------------------------------------------------
 # Parsing entry points
 # ---------------------------------------------------------------------------
-
 def parse_ridft(source: str | Path) -> RidftSummary:
     """Parse ridft output. `source` is a path OR the file content as string."""
     text = _read_text(source)
@@ -147,6 +159,14 @@ def parse_ridft(source: str | Path) -> RidftSummary:
         unit = (m.group(2) or "s").lower()
         summary.cpu_time_str = f"{raw} {unit}".strip()
         summary.cpu_time_s = _to_seconds(raw, unit)
+
+    # --- WALL time ---
+    m = _RE_WALL_TIME.search(text)
+    if m:
+        raw = m.group(1)
+        unit = (m.group(2) or "s").lower()
+        summary.wall_time_str = f"{raw} {unit}".strip()
+        summary.wall_time_s = _to_seconds(raw, unit)
 
     # --- HOMO-LUMO ---
     m = _RE_HOMO_LUMO.search(text)
@@ -188,7 +208,6 @@ def parse_energy_file(source: str | Path) -> float | None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def _read_text(source: str | Path) -> str:
     """Accept a Path/str path OR a raw string. Heuristic: if `source` is a Path
     or a short string with no newlines and the file exists, treat as path."""

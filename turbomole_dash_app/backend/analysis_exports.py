@@ -118,7 +118,7 @@ def gnuplot_optimization(csv_filename: str, meta: JobMeta) -> str:
     return _STYLE_BLOCK + f"""\
 set term wxt 1 enhanced dashed size 600,400 font "DejaVu Sans,12"
 set multiplot layout 1,1
-set title "{title}"
+set title "{title}" nonenhanced
 f1="{fname}"
 set datafile separator ","
 # Skip header line when computing E0 (column 2 = scf_energy_Ha)
@@ -150,7 +150,7 @@ def gnuplot_trajectory(csv_filename: str, meta: JobMeta) -> str:
     return _STYLE_BLOCK + f"""\
 set term wxt 2 enhanced dashed size 600,400 font "DejaVu Sans,12"
 set multiplot layout 1,1
-set title "{title}"
+set title "{title}" nonenhanced
 f1="{fname}"
 set datafile separator ","
 set logscale y
@@ -173,7 +173,7 @@ def gnuplot_spectrum(csv_filename: str, meta: JobMeta) -> str:
     return _STYLE_BLOCK + f"""\
 set term wxt 1 enhanced dashed size 700,400 font "DejaVu Sans,12"
 set multiplot layout 1,1
-set title "{title}"
+set title "{title}" nonenhanced
 f1="{fname}"
 set datafile separator ","
 # Filter out near-zero translational/rotational modes (column 3 != near_zero)

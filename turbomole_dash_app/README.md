@@ -63,7 +63,7 @@ Open <http://127.0.0.1:8050>.
 
 1. Next to `app.py` (recommended)
 2. Current working directory
-3. `~/.turbomole_orchestrator/config.yaml`
+3. `~/turbomole_orchestrator/config.yaml`
 
 Each cluster declares:
 
@@ -81,7 +81,7 @@ Authentication uses `ssh-agent` by default; passwords are never stored.
 1. **New job tab** — drop an xyz/pdb/mol structure, pick functional/basis/task,
    pick a cluster, hit *Build & submit*.
 2. The builder writes `coord`, `define.inp`, and `submit.slurm` locally to
-   `~/.turbomole_orchestrator/workspace/<jobname>_<ts>/`.
+   `~/turbomole_orchestrator/workspace/<jobname>_<ts>/`.
 3. The directory is SFTP-uploaded; `sbatch submit.slurm` is run on the cluster.
 4. The SLURM script runs `define < define.inp` first to build a proper `control`,
    then runs `ridft` / `jobex -ri` / `frog` according to the task.
