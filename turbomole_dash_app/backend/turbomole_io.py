@@ -9,6 +9,10 @@ Design notes:
   `define`) and let it build the control on the cluster.
 - `define`'s prompt sequence differs between Turbomole versions, so we
   factor that out into per-version driver classes.
+- For AIMD jobs we also generate `mdprep.inp` locally so that the
+  cluster-side `mdprep` step can be fully scripted (constraints, T,
+  timestep, number of steps). The actual `mdmaster` is produced by
+  `mdprep` at submit time on the cluster.
 
 Supported versions: 7.8, 8.0 (placeholder until 8.0 is released; the
 driver inherits from 7.8 and overrides where needed).
@@ -18,12 +22,15 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ase import Atoms
 from ase.io import read as ase_read, write as ase_write
+
+from backend.opt_trajectory import BOHR_TO_ANGSTROM
 
 
 SUPPORTED_INPUT_FORMATS = (
@@ -33,6 +40,12 @@ SUPPORTED_INPUT_FORMATS = (
 TASK_TYPES = ("single_point", "optimization", "aimd", "frequencies")
 
 SUPPORTED_TM_VERSIONS = ("7.8", "8.0")
+
+# Atomic-unit timestep <-> femtoseconds (1 a.u. of time = 0.024188843265857 fs)
+AU_TIME_TO_FS = 0.024188843265857
+
+# Supported constraint algorithms in `mdprep`'s constraints submenu.
+CONSTRAINT_ALGORITHMS = ("shake", "maltshake")
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +100,10 @@ def available_dispersions() -> list[tuple[str, str]]:
     return [(k, v[1]) for k, v in DISPERSION_OPTIONS.items()]
 
 
+def available_constraint_algorithms() -> tuple[str, ...]:
+    return CONSTRAINT_ALGORITHMS
+
+
 # ---------------------------------------------------------------------------
 # Structure I/O
 # ---------------------------------------------------------------------------
@@ -111,12 +128,65 @@ def write_coord(atoms: Atoms, workdir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# AIMD: distance-constraint parsing
+# ---------------------------------------------------------------------------
+
+# Each constraint is (atom_i, atom_j, distance_Angstrom). Atom indices are
+# 1-based, exactly as written in Turbomole's `$coord` section, and the
+# distance is supplied in Angstrom by the user (the renderer converts to
+# Bohr before writing mdprep.inp because mdprep's internal unit is Bohr).
+ConstraintTriple = tuple[int, int, float]
+
+
+_CONSTRAINT_TOKEN_RE = re.compile(
+    r"^\s*(\d+)\s+(\d+)\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$"
+)
+
+
+def parse_constraints(text: str) -> list[ConstraintTriple]:
+    """Parse the constraints textarea: 'at1 at2 d_A; at1 at2 d_A; ...'.
+
+    Empty input yields []. Whitespace-tolerant. Raises ValueError with a
+    descriptive message for the first malformed entry so the UI can
+    surface it as feedback.
+    """
+    if not text or not text.strip():
+        return []
+    out: list[ConstraintTriple] = []
+    for raw in text.split(";"):
+        token = raw.strip()
+        if not token:
+            continue
+        m = _CONSTRAINT_TOKEN_RE.match(token)
+        if not m:
+            raise ValueError(
+                f"Invalid constraint entry: {token!r}. "
+                "Expected 'at1 at2 distance_A' (e.g. '1 2 1.09')."
+            )
+        i, j, d = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if i == j:
+            raise ValueError(
+                f"Invalid constraint {token!r}: atom indices must differ."
+            )
+        if i < 1 or j < 1:
+            raise ValueError(
+                f"Invalid constraint {token!r}: atom indices are 1-based."
+            )
+        if d <= 0.0:
+            raise ValueError(
+                f"Invalid constraint {token!r}: distance must be positive."
+            )
+        out.append((i, j, d))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Calculation spec — version-independent description of the job
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CalcSpec:
-    """All physical/chemical parameters needed to drive `define`."""
+    """All physical/chemical parameters needed to drive `define` (+ mdprep)."""
     functional: str          # UI name, e.g. "BP86"
     basis_set: str
     task_type: str
@@ -128,9 +198,12 @@ class CalcSpec:
     use_ri: bool = True
     dispersion: str = "none" # none | d3 | d3bj | d4
     # AIMD-specific
-    aimd_steps: int = 500
-    aimd_timestep_fs: float = 0.5
+    aimd_steps: int = 256
+    aimd_timestep_au: float = 80.0
     aimd_temperature_K: float = 300.0
+    aimd_use_constraints: bool = False
+    aimd_constraint_algorithm: str = "shake"     # shake | maltshake
+    aimd_constraints: list[ConstraintTriple] = field(default_factory=list)
 
     def validate(self) -> None:
         if self.task_type not in TASK_TYPES:
@@ -146,6 +219,97 @@ class CalcSpec:
                 f"Unknown dispersion {self.dispersion!r}. "
                 f"Allowed: {list(DISPERSION_OPTIONS.keys())}"
             )
+        if self.task_type == "aimd":
+            if self.aimd_steps < 1:
+                raise ValueError("aimd_steps must be >= 1")
+            if self.aimd_timestep_au <= 0:
+                raise ValueError("aimd_timestep_au must be > 0")
+            if self.aimd_temperature_K <= 0:
+                raise ValueError("aimd_temperature_K must be > 0")
+            if self.aimd_constraint_algorithm not in CONSTRAINT_ALGORITHMS:
+                raise ValueError(
+                    f"Unknown constraint algorithm "
+                    f"{self.aimd_constraint_algorithm!r}. "
+                    f"Allowed: {CONSTRAINT_ALGORITHMS}"
+                )
+            if self.aimd_use_constraints and not self.aimd_constraints:
+                raise ValueError(
+                    "aimd_use_constraints is True but no constraints "
+                    "were provided."
+                )
+
+
+# ---------------------------------------------------------------------------
+# mdprep.inp generator
+# ---------------------------------------------------------------------------
+#
+# mdprep is interactive. Each main menu entry below corresponds to one of
+# the seven steps described by the user; for the steps we don't customise
+# we simply press `q` to accept the defaults already produced by the
+# previous `ridft` run and the `coord` / `control` files.
+#
+# Menu summary as implemented here (Turbomole 7.x/8.x):
+#   1) Number of atoms        — accept (q)
+#   2) Initial positions       — accept ($coord, q)
+#   3) Cavity barrier          — accept defaults (q)
+#   4) Distance constraints    — optional; a → g → <alg> → e <i j d_Bohr>... → q
+#   5) Initial velocities (T)  — i → <T> → q
+#   6) Timestep                — i → <dt_au> → q → q → q
+#   7) Number of MD steps      — i → <n_steps> → q
+
+def build_mdprep_input(spec: CalcSpec) -> str:
+    """Render mdprep.inp from a CalcSpec (task_type must be 'aimd')."""
+    if spec.task_type != "aimd":
+        raise ValueError("build_mdprep_input is only valid for task_type='aimd'")
+    spec.validate()
+
+    lines: list[str] = []
+
+    # 1) Number of atoms — take from control
+    lines.append("q")
+
+    # 2) Initial positions — take from $coord
+    lines.append("q")
+
+    # 3) Cavity barrier attributes — skip
+    lines.append("q")
+
+    # 4) Distance constraints (optional)
+    if spec.aimd_use_constraints and spec.aimd_constraints:
+        lines.append("a")
+        lines.append("g")
+        lines.append(spec.aimd_constraint_algorithm)
+        for i, j, d_ang in spec.aimd_constraints:
+            d_bohr = d_ang / BOHR_TO_ANGSTROM
+            lines.append("e")
+            # mdprep tolerates whitespace; use plain spaces.
+            lines.append(f"{i} {j} {d_bohr:.10f}")
+        lines.append("q")
+    else:
+        # No constraints menu interaction needed — accept defaults.
+        lines.append("q")
+
+    # 5) Initial velocity / temperature
+    lines.append("i")
+    lines.append(f"{spec.aimd_temperature_K:g}")
+    lines.append("q")
+
+    # 6) Timestep (a.u.)
+    lines.append("i")
+    lines.append(f"{spec.aimd_timestep_au:g}")
+    lines.append("q")
+    lines.append("q")
+    lines.append("q")
+
+    # 7) Number of MD steps
+    lines.append("i")
+    lines.append(str(int(spec.aimd_steps)))
+    lines.append("q")
+
+    # A few safety blank lines so any extra final prompt gets the default.
+    lines += [""] * 3
+
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -317,10 +481,18 @@ class DefineDriver_7_8(DefineDriver):
                 "aoforce > aoforce.out 2>&1",
             ]
         if spec.task_type == "aimd":
+            # mdprep.inp is generated locally by build_control_file and
+            # uploaded along with coord/define.inp/submit.slurm.
             return common_pre + [
                 "# 2) AIMD --------------------------------------------",
                 "ridft > ridft.out 2>&1",
-                "mdprep -default > mdprep.out 2>&1 || true",
+                "# 2b) Build mdmaster from the user-provided mdprep.inp",
+                "if [ ! -f mdprep.inp ]; then",
+                '    echo "ERROR: mdprep.inp not found in job dir" >&2',
+                "    exit 1",
+                "fi",
+                "mdprep < mdprep.inp > mdprep.out 2>&1",
+                "# 2c) Propagate trajectory",
                 "frog > frog.out 2>&1",
             ]
         raise ValueError(f"Unknown task_type {spec.task_type!r}")
@@ -372,9 +544,12 @@ def build_control_file(
     grid: str = "m4",
     use_ri: bool = True,
     dispersion: str = "none",
-    aimd_steps: int = 500,
-    aimd_timestep_fs: float = 0.5,
+    aimd_steps: int = 256,
+    aimd_timestep_au: float = 80.0,
     aimd_temperature_K: float = 300.0,
+    aimd_use_constraints: bool = False,
+    aimd_constraint_algorithm: str = "shake",
+    aimd_constraints: list[ConstraintTriple] | None = None,
     turbomole_version: str = "7.8",
 ) -> Path:
     """
@@ -383,10 +558,11 @@ def build_control_file(
     Writes:
       - coord       : geometry in Turbomole format
       - define.inp  : stdin script for `define` (version-specific)
+      - mdprep.inp  : stdin script for `mdprep` (only when task_type=='aimd')
       - .tm_params  : JSON sidecar with the spec (useful for debugging)
 
     The actual `control` file is generated by `define` on the cluster
-    at submit time.
+    at submit time; `mdmaster` is generated by `mdprep` at submit time.
 
     Returns the path to define.inp.
     """
@@ -399,8 +575,11 @@ def build_control_file(
         scf_conv=scf_conv, scf_iter=scf_iter, grid=grid, use_ri=use_ri,
         dispersion=dispersion,
         aimd_steps=aimd_steps,
-        aimd_timestep_fs=aimd_timestep_fs,
+        aimd_timestep_au=aimd_timestep_au,
         aimd_temperature_K=aimd_temperature_K,
+        aimd_use_constraints=aimd_use_constraints,
+        aimd_constraint_algorithm=aimd_constraint_algorithm,
+        aimd_constraints=list(aimd_constraints or []),
     )
     spec.validate()
 
@@ -408,10 +587,14 @@ def build_control_file(
     define_inp = workdir / "define.inp"
     define_inp.write_text(driver.build_define_input(spec))
 
+    if spec.task_type == "aimd":
+        (workdir / "mdprep.inp").write_text(build_mdprep_input(spec))
+
     sidecar = {
         "turbomole_version": turbomole_version,
         "driver": driver.version,
-        "spec": spec.__dict__,
+        "spec": {**spec.__dict__,
+                 "aimd_constraints": list(spec.aimd_constraints)},
     }
     (workdir / ".tm_params").write_text(json.dumps(sidecar, indent=2))
 

@@ -32,8 +32,9 @@ from backend.result_parser import (
 )
 from backend.slurm import SlurmParams, build_slurm_script
 from backend.turbomole_io import (
+    AU_TIME_TO_FS,
     SUPPORTED_INPUT_FORMATS, build_control_file, load_structure_from_bytes,
-    turbomole_driver_commands,
+    parse_constraints, turbomole_driver_commands,
 )
 from remote import slurm_remote, ssh_client
 from workers.poller import refresh_active_jobs, refresh_single_job
@@ -54,7 +55,7 @@ def register_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
     register_analysis_callbacks(app, cfg)
 
 # ===========================================================================
-# Tab 1 — New job  (unchanged)
+# Tab 1 — New job
 # ===========================================================================
 
 def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
@@ -79,6 +80,28 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
     )
     def _toggle_aimd(task):
         return {"display": "block"} if task == "aimd" else {"display": "none"}
+
+    @app.callback(
+        Output("aimd-constraints-group", "style"),
+        Input("chk-aimd-constraints", "value"),
+    )
+    def _toggle_constraints_group(values):
+        return {"display": "block"} if "on" in (values or []) else {"display": "none"}
+
+    @app.callback(
+        Output("aimd-dt-fs-label", "children"),
+        Input("inp-aimd-dt-au", "value"),
+    )
+    def _update_dt_fs_label(dt_au):
+        """Live display of the timestep in femtoseconds next to the a.u.
+        input (1 a.u. of time ≈ 0.02418884 fs)."""
+        try:
+            dt = float(dt_au) if dt_au is not None else 0.0
+        except (TypeError, ValueError):
+            return ""
+        if dt <= 0:
+            return ""
+        return f"≈ {dt * AU_TIME_TO_FS:.4f} fs"
 
     @app.callback(
         Output("job-staging-store", "data"),
@@ -125,14 +148,18 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         State("chk-ri", "value"),
         State("dd-grid", "value"),
         State("inp-aimd-steps", "value"),
-        State("inp-aimd-dt", "value"),
+        State("inp-aimd-dt-au", "value"),
         State("inp-aimd-T", "value"),
+        State("chk-aimd-constraints", "value"),
+        State("dd-aimd-constraint-alg", "value"),
+        State("inp-aimd-constraints", "value"),
         State("dd-dispersion", "value"),
         prevent_initial_call=True,
     )
     def _preview(n, staging, cluster_name,
                  functional, basis, task, charge, mult,
-                 ri, grid, aimd_steps, aimd_dt, aimd_T,
+                 ri, grid, aimd_steps, aimd_dt_au, aimd_T,
+                 aimd_use_constraints, aimd_alg, aimd_constraints_text,
                  dispersion):
         if not staging:
             return "Upload a structure first."
@@ -142,16 +169,27 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 
         atoms = pickle.loads(base64.b64decode(staging["atoms_b64"]))
         tmp = cfg.local_workdir / f".preview_{int(time.time())}"
+
         try:
+            use_constraints = "on" in (aimd_use_constraints or [])
+            constraints = []
+            if task == "aimd" and use_constraints:
+                # parse_constraints raises ValueError on malformed input;
+                # surface it inline as a build error so the user can fix.
+                constraints = parse_constraints(aimd_constraints_text or "")
+
             build_control_file(
                 atoms, tmp,
                 functional=functional, basis_set=basis, task_type=task,
                 charge=int(charge or 0), multiplicity=int(mult or 1),
                 grid=grid, use_ri="ri" in (ri or []),
                 dispersion=dispersion or "none",
-                aimd_steps=int(aimd_steps or 500),
-                aimd_timestep_fs=float(aimd_dt or 0.5),
+                aimd_steps=int(aimd_steps or 256),
+                aimd_timestep_au=float(aimd_dt_au or 80.0),
                 aimd_temperature_K=float(aimd_T or 300),
+                aimd_use_constraints=use_constraints,
+                aimd_constraint_algorithm=aimd_alg or "shake",
+                aimd_constraints=constraints,
                 turbomole_version=tm_version,
             )
             define_text = (tmp / "define.inp").read_text()
@@ -162,7 +200,21 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                 f"#  Dispersion correction: {dispersion}\n"
                 f"#\n"
             )
-            return header + define_text
+            preview = header + define_text
+
+            # When AIMD is selected, also show the mdprep.inp that drives
+            # mdmaster generation on the cluster.
+            mdprep_path = tmp / "mdprep.inp"
+            if task == "aimd" and mdprep_path.exists():
+                preview += (
+                    "\n\n# ----------------------------------------------------\n"
+                    "# mdprep.inp (fed to `mdprep` on the cluster to build\n"
+                    "# the mdmaster file consumed by `frog`)\n"
+                    "# ----------------------------------------------------\n"
+                )
+                preview += mdprep_path.read_text()
+
+            return preview
         except Exception as exc:
             return f"# Error: {exc}"
         finally:
@@ -183,8 +235,11 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         State("chk-ri", "value"),
         State("dd-grid", "value"),
         State("inp-aimd-steps", "value"),
-        State("inp-aimd-dt", "value"),
+        State("inp-aimd-dt-au", "value"),
         State("inp-aimd-T", "value"),
+        State("chk-aimd-constraints", "value"),
+        State("dd-aimd-constraint-alg", "value"),
+        State("inp-aimd-constraints", "value"),
         State("inp-partition", "value"),
         State("inp-walltime", "value"),
         State("inp-nodes", "value"),
@@ -196,7 +251,8 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
     )
     def _submit(n, staging, job_name, cluster_name,
                 functional, basis, task, charge, mult, ri, grid,
-                aimd_steps, aimd_dt, aimd_T,
+                aimd_steps, aimd_dt_au, aimd_T,
+                aimd_use_constraints, aimd_alg, aimd_constraints_text,
                 partition, walltime, nodes, ntasks, mem, reservation,
                 dispersion):
         if not n:
@@ -210,6 +266,16 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             atoms = pickle.loads(base64.b64decode(staging["atoms_b64"]))
 
             use_ri = "ri" in (ri or [])
+            use_constraints = "on" in (aimd_use_constraints or [])
+            constraints = []
+            if task == "aimd" and use_constraints:
+                # Will surface as a toast through the except branch below
+                # if the textarea is malformed.
+                constraints = parse_constraints(aimd_constraints_text or "")
+                if not constraints:
+                    raise ValueError(
+                        "Distance constraints are enabled but the list is empty."
+                    )
 
             ts = time.strftime("%Y%m%d-%H%M%S")
             safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in job_name)
@@ -224,9 +290,12 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
                 charge=int(charge or 0), multiplicity=int(mult or 1),
                 grid=grid, use_ri=use_ri,
                 dispersion=disp,
-                aimd_steps=int(aimd_steps or 500),
-                aimd_timestep_fs=float(aimd_dt or 0.5),
+                aimd_steps=int(aimd_steps or 256),
+                aimd_timestep_au=float(aimd_dt_au or 80.0),
                 aimd_temperature_K=float(aimd_T or 300),
+                aimd_use_constraints=use_constraints,
+                aimd_constraint_algorithm=aimd_alg or "shake",
+                aimd_constraints=constraints,
                 turbomole_version=cluster.turbomole_version,
             )
 
@@ -260,18 +329,33 @@ def _register_new_job_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             )
             (local_dir / "submit.slurm").write_text(script)
 
+            submit_meta = {
+                "partition": sl.partition, "time": sl.time,
+                "nodes": sl.nodes, "ntasks": sl.ntasks, "mem": sl.mem,
+                "reservation": sl.reservation,
+                "dispersion": disp,
+                "turbomole_version": cluster.turbomole_version,
+            }
+            # Record AIMD-specific metadata so it shows in the job detail
+            # modal and helps reproduce the run later.
+            if task == "aimd":
+                submit_meta["aimd"] = {
+                    "steps": int(aimd_steps or 256),
+                    "timestep_au": float(aimd_dt_au or 80.0),
+                    "temperature_K": float(aimd_T or 300),
+                    "use_constraints": use_constraints,
+                    "constraint_algorithm": aimd_alg or "shake",
+                    "constraints": [
+                        {"i": i, "j": j, "d_A": d} for i, j, d in constraints
+                    ],
+                }
+
             rec = JobRecord(
                 name=job_name, cluster=cluster_name, state="DRAFT",
                 task_type=task, local_dir=str(local_dir), remote_dir=remote_dir,
                 functional=functional, basis_set=basis,
                 charge=int(charge or 0), multiplicity=int(mult or 1),
-                submit_meta={
-                    "partition": sl.partition, "time": sl.time,
-                    "nodes": sl.nodes, "ntasks": sl.ntasks, "mem": sl.mem,
-                    "reservation": sl.reservation,
-                    "dispersion": disp,
-                    "turbomole_version": cluster.turbomole_version,
-                },
+                submit_meta=submit_meta,
             )
             job_id = insert_job(rec)
 
@@ -941,6 +1025,27 @@ def _build_detail_body(cfg: AppConfig, job: dict) -> html.Div:
     ])
     rows.append(_section_card("Calculation", calc_items))
 
+    # ----- AIMD parameters (only for aimd tasks) -----
+    if job["task_type"] == "aimd" and sub.get("aimd"):
+        a = sub["aimd"]
+        aimd_items = [
+            _kv("MD steps", a.get("steps", "—")),
+            _kv("Timestep (a.u.)", a.get("timestep_au", "—")),
+            _kv("Temperature (K)", a.get("temperature_K", "—")),
+        ]
+        if a.get("use_constraints"):
+            aimd_items.append(_kv("Constraint algorithm",
+                                  a.get("constraint_algorithm", "—")))
+            constraints = a.get("constraints") or []
+            if constraints:
+                lst = html.Ul(
+                    [html.Li(f"atom {c['i']} — atom {c['j']} : {c['d_A']:.4f} Å")
+                     for c in constraints],
+                    className="mb-0 small",
+                )
+                aimd_items.append(_kv("Constraints", lst))
+        rows.append(_section_card("Ab initio MD parameters", aimd_items))
+
     # ----- Resources requested -----
     res_items = [
         _kv("Partition", sub.get("partition", "—")),
@@ -1406,18 +1511,6 @@ def _register_db_inspector_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 # ===========================================================================
 # Protocols — save/load/delete/reset
 # ===========================================================================
-#
-# A "protocol" is the New job form state minus the molecular structure,
-# persisted to ~/turbomole_orchestrator/protocols/<name>.json so users can
-# reuse calculation setups across molecules.
-#
-# These callbacks orchestrate four user actions:
-#   * dropdown change   -> load values from the chosen JSON
-#   * Save as...        -> open modal, capture name+description, write JSON
-#   * Delete            -> delete the JSON of the currently-selected protocol
-#                          (reuses the global confirm-modal for safety)
-#   * Reset             -> repopulate every field with hardcoded defaults
-# ---------------------------------------------------------------------------
 
 def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 
@@ -1445,25 +1538,28 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
 
     # ----- Load values from a selected protocol ----------------------------
     @app.callback(
-        Output("dd-functional",    "value", allow_duplicate=True),
-        Output("dd-basis",         "value", allow_duplicate=True),
-        Output("chk-ri",           "value", allow_duplicate=True),
-        Output("dd-grid",          "value", allow_duplicate=True),
-        Output("dd-dispersion",    "value", allow_duplicate=True),
-        Output("rad-task",         "value", allow_duplicate=True),
-        Output("inp-charge",       "value", allow_duplicate=True),
-        Output("inp-mult",         "value", allow_duplicate=True),
-        Output("inp-aimd-steps",   "value", allow_duplicate=True),
-        Output("inp-aimd-dt",      "value", allow_duplicate=True),
-        Output("inp-aimd-T",       "value", allow_duplicate=True),
-        Output("dd-cluster",       "value", allow_duplicate=True),
-        Output("inp-partition",    "value", allow_duplicate=True),
-        Output("inp-walltime",     "value", allow_duplicate=True),
-        Output("inp-nodes",        "value", allow_duplicate=True),
-        Output("inp-ntasks",       "value", allow_duplicate=True),
-        Output("inp-mem",          "value", allow_duplicate=True),
-        Output("inp-reservation",  "value", allow_duplicate=True),
-        Output("last-action",      "data",  allow_duplicate=True),
+        Output("dd-functional",          "value", allow_duplicate=True),
+        Output("dd-basis",               "value", allow_duplicate=True),
+        Output("chk-ri",                 "value", allow_duplicate=True),
+        Output("dd-grid",                "value", allow_duplicate=True),
+        Output("dd-dispersion",          "value", allow_duplicate=True),
+        Output("rad-task",               "value", allow_duplicate=True),
+        Output("inp-charge",             "value", allow_duplicate=True),
+        Output("inp-mult",               "value", allow_duplicate=True),
+        Output("inp-aimd-steps",         "value", allow_duplicate=True),
+        Output("inp-aimd-dt-au",         "value", allow_duplicate=True),
+        Output("inp-aimd-T",             "value", allow_duplicate=True),
+        Output("chk-aimd-constraints",   "value", allow_duplicate=True),
+        Output("dd-aimd-constraint-alg", "value", allow_duplicate=True),
+        Output("inp-aimd-constraints",   "value", allow_duplicate=True),
+        Output("dd-cluster",             "value", allow_duplicate=True),
+        Output("inp-partition",          "value", allow_duplicate=True),
+        Output("inp-walltime",           "value", allow_duplicate=True),
+        Output("inp-nodes",              "value", allow_duplicate=True),
+        Output("inp-ntasks",             "value", allow_duplicate=True),
+        Output("inp-mem",                "value", allow_duplicate=True),
+        Output("inp-reservation",        "value", allow_duplicate=True),
+        Output("last-action",            "data",  allow_duplicate=True),
         Input("dd-protocol", "value"),
         Input("btn-proto-reset", "n_clicks"),
         prevent_initial_call=True,
@@ -1474,7 +1570,7 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         trig = ctx.triggered_id
 
         first_cluster = next(iter(cfg.clusters.keys()), None)
-        N_OUTPUTS = 18   # outputs above (without last-action)
+        N_OUTPUTS = 21   # outputs above (without last-action)
 
         if trig == "btn-proto-reset":
             payload = proto_mod.defaults_payload(first_cluster=first_cluster)
@@ -1511,6 +1607,7 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         sub = payload["submission"]
 
         ri_value = ["ri"] if method.get("use_ri") else []
+        cons_value = ["on"] if task.get("aimd_use_constraints") else []
 
         return (
             method.get("functional"),
@@ -1522,8 +1619,11 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             task.get("charge"),
             task.get("multiplicity"),
             task.get("aimd_steps"),
-            task.get("aimd_timestep_fs"),
+            task.get("aimd_timestep_au"),
             task.get("aimd_temperature_K"),
+            cons_value,
+            task.get("aimd_constraint_algorithm", "shake"),
+            task.get("aimd_constraints_text", ""),
             sub.get("cluster") or first_cluster,
             sub.get("partition") or "",
             sub.get("walltime") or "",
@@ -1563,31 +1663,35 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         State("inp-proto-name", "value"),
         State("inp-proto-description", "value"),
         # All the New-job form values:
-        State("dd-functional",   "value"),
-        State("dd-basis",        "value"),
-        State("chk-ri",          "value"),
-        State("dd-grid",         "value"),
-        State("dd-dispersion",   "value"),
-        State("rad-task",        "value"),
-        State("inp-charge",      "value"),
-        State("inp-mult",        "value"),
-        State("inp-aimd-steps",  "value"),
-        State("inp-aimd-dt",     "value"),
-        State("inp-aimd-T",      "value"),
-        State("dd-cluster",      "value"),
-        State("inp-partition",   "value"),
-        State("inp-walltime",    "value"),
-        State("inp-nodes",       "value"),
-        State("inp-ntasks",      "value"),
-        State("inp-mem",         "value"),
-        State("inp-reservation", "value"),
-        State("protocols-version", "data"),
+        State("dd-functional",           "value"),
+        State("dd-basis",                "value"),
+        State("chk-ri",                  "value"),
+        State("dd-grid",                 "value"),
+        State("dd-dispersion",           "value"),
+        State("rad-task",                "value"),
+        State("inp-charge",              "value"),
+        State("inp-mult",                "value"),
+        State("inp-aimd-steps",          "value"),
+        State("inp-aimd-dt-au",          "value"),
+        State("inp-aimd-T",              "value"),
+        State("chk-aimd-constraints",    "value"),
+        State("dd-aimd-constraint-alg",  "value"),
+        State("inp-aimd-constraints",    "value"),
+        State("dd-cluster",              "value"),
+        State("inp-partition",           "value"),
+        State("inp-walltime",            "value"),
+        State("inp-nodes",               "value"),
+        State("inp-ntasks",              "value"),
+        State("inp-mem",                 "value"),
+        State("inp-reservation",         "value"),
+        State("protocols-version",       "data"),
         prevent_initial_call=True,
     )
     def _save_protocol(n, name, description,
                        functional, basis, ri, grid, dispersion,
                        task, charge, mult,
-                       aimd_steps, aimd_dt, aimd_T,
+                       aimd_steps, aimd_dt_au, aimd_T,
+                       aimd_use_cons, aimd_alg, aimd_cons_text,
                        cluster, partition, walltime,
                        nodes, ntasks, mem, reservation,
                        version):
@@ -1606,12 +1710,15 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
             "dispersion": dispersion or "none",
         }
         task_d = {
-            "type":               task,
-            "charge":             int(charge or 0),
-            "multiplicity":       int(mult or 1),
-            "aimd_steps":         int(aimd_steps or 500),
-            "aimd_timestep_fs":   float(aimd_dt or 0.5),
-            "aimd_temperature_K": float(aimd_T or 300),
+            "type":                      task,
+            "charge":                    int(charge or 0),
+            "multiplicity":              int(mult or 1),
+            "aimd_steps":                int(aimd_steps or 256),
+            "aimd_timestep_au":          float(aimd_dt_au or 80.0),
+            "aimd_temperature_K":        float(aimd_T or 300),
+            "aimd_use_constraints":      "on" in (aimd_use_cons or []),
+            "aimd_constraint_algorithm": aimd_alg or "shake",
+            "aimd_constraints_text":     aimd_cons_text or "",
         }
         submission = {
             "cluster":     cluster,
@@ -1667,12 +1774,6 @@ def _register_protocol_callbacks(app: dash.Dash, cfg: AppConfig) -> None:
         ]
         return True, body, {"action": "delete-protocol", "path": selected_path}
 
-    # The confirm-modal's OK button already lives in
-    # _register_jobs_table_callbacks._resolve_confirm. To avoid touching
-    # that callback (and risk an Output conflict), we listen to the *same*
-    # OK button here, react ONLY when the pending action is ours, and just
-    # delete the file + bump the version. The other callback's branches
-    # don't fire because `action != delete-remote/clean-job`.
     @app.callback(
         Output("protocols-version", "data", allow_duplicate=True),
         Output("dd-protocol", "value",      allow_duplicate=True),

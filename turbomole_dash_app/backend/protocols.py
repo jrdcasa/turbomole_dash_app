@@ -3,7 +3,8 @@ Save / load reusable submission "protocols" as JSON.
 
 A protocol captures everything in the New job tab *except* the molecular
 structure: method, basis, RI, grid, task type, charge, multiplicity, AIMD
-params, cluster, partition, walltime, nodes, ntasks, mem, reservation.
+params (incl. distance constraints), cluster, partition, walltime, nodes,
+ntasks, mem, reservation.
 
 The idea: configure once for a workflow (e.g. BP86-D3 optimization on
 drago with 48 cores), save it under a memorable name, then reuse it for
@@ -37,9 +38,14 @@ DEFAULTS: dict = {
         "type": "single_point",
         "charge": 0,
         "multiplicity": 1,
-        "aimd_steps": 500,
-        "aimd_timestep_fs": 0.5,
+        # AIMD defaults follow the user's preferred mdprep settings:
+        # 256 steps, 80.0 a.u. timestep (~1.935 fs), 300 K, no constraints.
+        "aimd_steps": 256,
+        "aimd_timestep_au": 80.0,
         "aimd_temperature_K": 300,
+        "aimd_use_constraints": False,
+        "aimd_constraint_algorithm": "shake",
+        "aimd_constraints_text": "",
     },
     "submission": {
         "cluster": None,        # filled at load-time with the first available

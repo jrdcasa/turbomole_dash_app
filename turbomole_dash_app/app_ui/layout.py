@@ -9,7 +9,10 @@ import dash_bootstrap_components as dbc
 
 from backend.config import AppConfig
 from backend.turbomole_io import (
-    available_functionals, available_basis_sets, TASK_TYPES, SUPPORTED_INPUT_FORMATS,
+    available_constraint_algorithms,
+    available_functionals, available_basis_sets,
+    AU_TIME_TO_FS,
+    TASK_TYPES, SUPPORTED_INPUT_FORMATS,
 )
 
 
@@ -436,38 +439,138 @@ def _card_task() -> dbc.Card:
                     value="single_point",
                     inline=False,
                 ),
-                html.Div(
-                    [
-                        dbc.Row(
-                            [
-                                dbc.Col(dbc.Label("MD steps"), width=4),
-                                dbc.Col(dbc.Input(id="inp-aimd-steps", type="number",
-                                                  value=500, min=1), width=8),
-                            ],
-                            className="g-2 mt-2 align-items-center",
-                        ),
-                        dbc.Row(
-                            [
-                                dbc.Col(dbc.Label("dt (fs)"), width=4),
-                                dbc.Col(dbc.Input(id="inp-aimd-dt", type="number",
-                                                  value=0.5, min=0.01, step=0.01), width=8),
-                            ],
-                            className="g-2 align-items-center",
-                        ),
-                        dbc.Row(
-                            [
-                                dbc.Col(dbc.Label("T (K)"), width=4),
-                                dbc.Col(dbc.Input(id="inp-aimd-T", type="number",
-                                                  value=300, min=1), width=8),
-                            ],
-                            className="g-2 align-items-center",
-                        ),
-                    ],
-                    id="aimd-params", style={"display": "none"},
-                ),
+                _aimd_params_block(),
             ]
         ),
         className="shadow-sm h-100",
+    )
+
+
+def _aimd_params_block() -> html.Div:
+    """Collapsible parameter group rendered only when the AIMD task is
+    selected. Drives the contents of mdprep.inp on the cluster.
+
+    Field order mirrors the mdprep menu walked by the renderer:
+      4) distance constraints (switch + algorithm + textarea)
+      5) initial velocities  → temperature (K)
+      6) timestep            → a.u. (with live fs equivalent)
+      7) number of MD steps
+
+    A separator at the bottom marks the space reserved for the
+    additional AIMD options that will be added next.
+    """
+    return html.Div(
+        [
+            html.Hr(),
+            html.H6(
+                [html.I(className="bi bi-broadcast-pin me-2"),
+                 "Ab initio MD parameters"],
+                className="text-muted small mb-2",
+            ),
+
+            # --- (4) Distance constraints --------------------------------
+            dbc.Checklist(
+                options=[{"label": " Apply distance constraints", "value": "on"}],
+                value=[],
+                id="chk-aimd-constraints",
+                switch=True,
+            ),
+            html.Div(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(dbc.Label("Algorithm"), width=4),
+                            dbc.Col(
+                                dcc.Dropdown(
+                                    id="dd-aimd-constraint-alg",
+                                    options=[{"label": a, "value": a}
+                                             for a in available_constraint_algorithms()],
+                                    value="shake",
+                                    clearable=False,
+                                ),
+                                width=8,
+                            ),
+                        ],
+                        className="g-2 mt-2 align-items-center",
+                    ),
+                    dbc.Label(
+                        ["Constraints ",
+                         html.Span("(at1 at2 distance_Å; separated by ';')",
+                                   className="text-muted small")],
+                        className="mt-2",
+                    ),
+                    dbc.Textarea(
+                        id="inp-aimd-constraints",
+                        placeholder="e.g. 1 2 1.09; 3 4 1.54",
+                        rows=2,
+                    ),
+                    dbc.Tooltip(
+                        "Atom indices are 1-based (same as Turbomole's $coord). "
+                        "Distances are entered in Angstrom and converted to Bohr "
+                        "internally before being written to mdprep.inp.",
+                        target="inp-aimd-constraints",
+                        delay={"show": 400, "hide": 100},
+                    ),
+                ],
+                id="aimd-constraints-group",
+                style={"display": "none"},
+            ),
+
+            # --- (5) Temperature ----------------------------------------
+            dbc.Row(
+                [
+                    dbc.Col(dbc.Label("Temperature (K)"), width=4),
+                    dbc.Col(
+                        dbc.Input(id="inp-aimd-T", type="number",
+                                  value=300, min=0.01, step=1),
+                        width=8,
+                    ),
+                ],
+                className="g-2 mt-3 align-items-center",
+            ),
+
+            # --- (6) Timestep -------------------------------------------
+            dbc.Row(
+                [
+                    dbc.Col(dbc.Label("Timestep (a.u.)"), width=4),
+                    dbc.Col(
+                        html.Div(
+                            [
+                                dbc.Input(id="inp-aimd-dt-au", type="number",
+                                          value=80.0, min=0.01, step=0.1,
+                                          style={"display": "inline-block",
+                                                 "width": "8rem",
+                                                 "verticalAlign": "middle"}),
+                                html.Span(id="aimd-dt-fs-label",
+                                          className="text-muted small ms-2"),
+                            ],
+                            className="d-flex align-items-center",
+                        ),
+                        width=8,
+                    ),
+                ],
+                className="g-2 mt-2 align-items-center",
+            ),
+
+            # --- (7) Number of MD steps ---------------------------------
+            dbc.Row(
+                [
+                    dbc.Col(dbc.Label("MD steps"), width=4),
+                    dbc.Col(
+                        dbc.Input(id="inp-aimd-steps", type="number",
+                                  value=256, min=1, step=1),
+                        width=8,
+                    ),
+                ],
+                className="g-2 mt-2 align-items-center",
+            ),
+
+            # --- Space reserved for additional AIMD options ------------
+            html.Hr(className="mt-3 mb-2"),
+            # more AIMD options below
+
+        ],
+        id="aimd-params", style={"display": "none"},
     )
 
 
